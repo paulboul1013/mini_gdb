@@ -21,7 +21,6 @@
 
 #define MAX_BREAKPOINTS 32
 #define MAX_SYMBOL_NAME 128
-#define PROGRAM_PATH "./hello"
 
 typedef struct {
     int id;
@@ -231,16 +230,6 @@ static int breakpoint_disable(pid_t pid, breakpoint_t *bp)
     }
 
     bp->enabled = 0;
-    return 0;
-}
-
-static int breakpoint_manager_enable_all(pid_t pid, breakpoint_manager_t *manager)
-{
-    for (size_t i = 0; i < manager->count; ++i) {
-        if (breakpoint_enable(pid, &manager->items[i]) == -1) {
-            return -1;
-        }
-    }
     return 0;
 }
 
@@ -835,56 +824,238 @@ static uintptr_t elf_value_to_runtime_address(
     return elf_value;
 }
 
+
+static int parse_runtime_address(const char *text, uintptr_t *address)
+{
+    const char *number = text;
+    if (text[0] == '*') {
+        ++number;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(number, &end, 0);
+
+    if (errno != 0 || end == number || *end != '\0') {
+        return -1;
+    }
+
+    *address = (uintptr_t)value;
+    return 0;
+}
+
+static void print_help(void)
+{
+    printf("\nMiniGDB commands:\n");
+    printf("  help, h                         Show this help message\n");
+    printf("  break, b <symbol|address>       Set a software breakpoint\n");
+    printf("                                  Examples: b main, b foo, b 0x401000\n");
+    printf("  continue, c                     Continue until next stop/breakpoint\n");
+    printf("  step, s                         Execute exactly one CPU instruction\n");
+    printf("  regs, r                         Show x86-64 CPU registers\n");
+    printf("  x <address|rip>                 Read one machine word from memory\n");
+    printf("  info breakpoints, info b        List managed breakpoints\n");
+    printf("  info target                     Show target ELF/runtime information\n");
+    printf("  quit, q                         Kill the debuggee and exit MiniGDB\n");
+    printf("\nChapter mapping:\n");
+    printf("  regs              Chapter 3 - register inspection\n");
+    printf("  x                 Chapter 4 - memory inspection\n");
+    printf("  break             Chapter 5 - INT3 software breakpoint\n");
+    printf("  step/info b       Chapter 6 - single-step + breakpoint manager\n");
+    printf("  break <symbol>    Chapter 7 - ELF symbol resolution\n");
+    printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n\n");
+}
+
+static int add_breakpoint_from_text(
+    pid_t pid,
+    breakpoint_manager_t *manager,
+    const elf_image_t *image,
+    uintptr_t load_bias,
+    const char *text)
+{
+    uintptr_t runtime_address = 0;
+    char display_name[MAX_SYMBOL_NAME];
+
+    if (parse_runtime_address(text, &runtime_address) == 0) {
+        snprintf(display_name, sizeof(display_name), "%s", text);
+        printf("[minigdb] raw runtime address = 0x%lx\n",
+               (unsigned long)runtime_address);
+    } else {
+        uintptr_t elf_value = 0;
+        if (elf_find_function(image, text, &elf_value) == -1) {
+            fprintf(stderr, "[minigdb] function symbol not found: %s\n", text);
+            return -1;
+        }
+
+        runtime_address =
+            elf_value_to_runtime_address(image, elf_value, load_bias);
+
+        snprintf(display_name, sizeof(display_name), "%s", text);
+
+        printf("[minigdb] resolved %-20s ELF=0x%lx runtime=0x%lx\n",
+               text,
+               (unsigned long)elf_value,
+               (unsigned long)runtime_address);
+    }
+
+    breakpoint_t *existing =
+        breakpoint_manager_find_by_address(manager, runtime_address);
+    if (existing != NULL) {
+        printf("[minigdb] breakpoint #%d already exists at 0x%lx (%s)\n",
+               existing->id,
+               (unsigned long)existing->address,
+               existing->symbol);
+        return 0;
+    }
+
+    breakpoint_t *bp =
+        breakpoint_manager_add(manager, runtime_address, display_name);
+    if (bp == NULL) {
+        return -1;
+    }
+
+    if (print_memory_word(pid, bp->address) == -1) {
+        return -1;
+    }
+
+    if (breakpoint_enable(pid, bp) == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Continue the stopped debuggee until something interesting happens.
+ * A managed breakpoint is fully recovered before control returns to the REPL.
+ * Therefore the prompt resumes immediately after the original breakpointed
+ * instruction has executed once and INT3 has been reinstalled.
+ *
+ * Returns:
+ *   1  debuggee is still alive and stopped
+ *   0  debuggee exited/terminated
+ *  -1  debugger error
+ */
+static int continue_until_stop(
+    pid_t pid,
+    breakpoint_manager_t *manager)
+{
+    if (continue_debuggee(pid) == -1) {
+        return -1;
+    }
+
+    printf("[minigdb] child continued\n");
+
+    for (;;) {
+        int status;
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+            return -1;
+        }
+
+        if (WIFEXITED(status)) {
+            printf("\n[minigdb] child exited with code %d\n",
+                   WEXITSTATUS(status));
+            return 0;
+        }
+
+        if (WIFSIGNALED(status)) {
+            printf("\n[minigdb] child terminated by signal %d\n",
+                   WTERMSIG(status));
+            return 0;
+        }
+
+        if (!WIFSTOPPED(status)) {
+            continue;
+        }
+
+        int sig = WSTOPSIG(status);
+        struct user_regs_struct regs;
+        if (get_registers(pid, &regs) == -1) {
+            return -1;
+        }
+
+        if (sig == SIGTRAP && regs.rip > 0) {
+            uintptr_t candidate = (uintptr_t)(regs.rip - 1);
+            breakpoint_t *bp =
+                breakpoint_manager_find_by_address(manager, candidate);
+
+            if (bp != NULL && bp->enabled) {
+                ++bp->hit_count;
+
+                printf("\n[minigdb] breakpoint #%d hit!\n", bp->id);
+                printf("[minigdb] symbol = %s\n", bp->symbol);
+                printf("[minigdb] address = 0x%lx\n",
+                       (unsigned long)bp->address);
+                printf("[minigdb] hit count = %lu\n", bp->hit_count);
+
+                print_registers(&regs);
+
+                if (recover_breakpoint(pid, bp) == -1) {
+                    return -1;
+                }
+
+                return 1;
+            }
+
+            printf("\n[minigdb] SIGTRAP at RIP 0x%llx\n", regs.rip);
+            return 1;
+        }
+
+        printf("\n[minigdb] child stopped by signal %d\n", sig);
+        return 1;
+    }
+}
+
+static int kill_debuggee(pid_t pid)
+{
+    if (ptrace(PTRACE_KILL, pid, NULL, NULL) == -1) {
+        if (errno == ESRCH) {
+            return 0;
+        }
+        perror("ptrace PTRACE_KILL");
+        return -1;
+    }
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1 && errno != ECHILD) {
+        perror("waitpid");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void trim_newline(char *line)
+{
+    size_t length = strlen(line);
+    while (length > 0 &&
+           (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+        line[--length] = '\0';
+    }
+}
+
 int main(int argc, char *argv[])
 {
     /*
-     * Chapter 8 still accepts function symbol names:
+     * New CLI shape:
      *
-     *     ./minigdb main foo
+     *     ./minigdb ./hello
      *
-     * Unlike Chapter 7, ./hello may now be a normal PIE executable.
+     * The target executable is no longer hard-coded.  Breakpoints and the
+     * execution-control operations are entered interactively in the REPL.
      */
-    if (argc < 2) {
-        fprintf(stderr,
-                "Usage: %s <function-symbol> [function-symbol ...]\n",
-                argv[0]);
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <program>\n", argv[0]);
+        fprintf(stderr, "Example: %s ./hello\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    if (argc - 1 > MAX_BREAKPOINTS) {
-        fprintf(stderr,
-                "[minigdb] too many requested breakpoints (max = %d)\n",
-                MAX_BREAKPOINTS);
-        return EXIT_FAILURE;
-    }
+    const char *program_path = argv[1];
 
     elf_image_t image;
-    if (elf_image_load(PROGRAM_PATH, &image) == -1) {
+    if (elf_image_load(program_path, &image) == -1) {
         return EXIT_FAILURE;
-    }
-
-    symbol_request_t requests[MAX_BREAKPOINTS];
-    size_t request_count = 0;
-
-    printf("\n[minigdb] ELF symbol values:\n");
-
-    for (int i = 1; i < argc; ++i) {
-        uintptr_t elf_value;
-        if (elf_find_function(&image, argv[i], &elf_value) == -1) {
-            fprintf(stderr,
-                    "[minigdb] function symbol not found: %s\n",
-                    argv[i]);
-            elf_image_destroy(&image);
-            return EXIT_FAILURE;
-        }
-
-        symbol_request_t *request = &requests[request_count++];
-        snprintf(request->symbol, sizeof(request->symbol), "%s", argv[i]);
-        request->elf_value = elf_value;
-
-        printf("[minigdb]   %-20s -> 0x%lx\n",
-               request->symbol,
-               (unsigned long)request->elf_value);
     }
 
     pid_t pid = fork();
@@ -900,11 +1071,12 @@ int main(int argc, char *argv[])
             _exit(EXIT_FAILURE);
         }
 
-        execl(PROGRAM_PATH, PROGRAM_PATH, NULL);
+        execl(program_path, program_path, NULL);
         perror("execl");
         _exit(EXIT_FAILURE);
     }
 
+    printf("[minigdb] target = %s\n", program_path);
     printf("[minigdb] child pid = %d\n", pid);
 
     int status;
@@ -925,6 +1097,7 @@ int main(int argc, char *argv[])
     uintptr_t load_bias;
     if (find_runtime_load_bias(pid, &image, &load_bias) == -1) {
         elf_image_destroy(&image);
+        kill_debuggee(pid);
         return EXIT_FAILURE;
     }
 
@@ -934,140 +1107,146 @@ int main(int argc, char *argv[])
     breakpoint_manager_t manager;
     breakpoint_manager_init(&manager);
 
-    printf("\n[minigdb] runtime symbol addresses:\n");
+    printf("\n[minigdb] target loaded and stopped. Type 'help' for commands.\n");
 
-    for (size_t i = 0; i < request_count; ++i) {
-        uintptr_t runtime_address =
-            elf_value_to_runtime_address(&image,
-                                         requests[i].elf_value,
-                                         load_bias);
+    int child_alive = 1;
+    char line[512];
 
-        printf("[minigdb]   %-20s -> 0x%lx "
-               "(ELF value 0x%lx)\n",
-               requests[i].symbol,
-               (unsigned long)runtime_address,
-               (unsigned long)requests[i].elf_value);
+    while (child_alive) {
+        printf("(minigdb) ");
+        fflush(stdout);
 
-        breakpoint_t *bp =
-            breakpoint_manager_add(&manager,
-                                   runtime_address,
-                                   requests[i].symbol);
-        if (bp == NULL) {
-            elf_image_destroy(&image);
-            return EXIT_FAILURE;
-        }
-    }
-
-    elf_image_destroy(&image);
-
-    printf("\n[minigdb] configured breakpoint manager:\n");
-    breakpoint_manager_print(&manager);
-
-    for (size_t i = 0; i < manager.count; ++i) {
-        printf("Before breakpoint #%d (%s):\n",
-               manager.items[i].id,
-               manager.items[i].symbol);
-        if (print_memory_word(pid, manager.items[i].address) == -1) {
-            return EXIT_FAILURE;
-        }
-    }
-
-    if (breakpoint_manager_enable_all(pid, &manager) == -1) {
-        return EXIT_FAILURE;
-    }
-
-    printf("\n[minigdb] after enabling all breakpoints:\n");
-    breakpoint_manager_print(&manager);
-
-    if (continue_debuggee(pid) == -1) {
-        return EXIT_FAILURE;
-    }
-
-    printf("[minigdb] child continued\n");
-
-    /*
-     * Chapter 6/7/8 event loop:
-     * breakpoint handling is unchanged because it only needs runtime addresses.
-     */
-    for (;;) {
-        if (waitpid(pid, &status, 0) == -1) {
-            perror("waitpid");
-            return EXIT_FAILURE;
-        }
-
-        if (WIFEXITED(status)) {
-            printf("\n[minigdb] child exited with code %d\n",
-                   WEXITSTATUS(status));
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\n");
             break;
         }
 
-        if (WIFSIGNALED(status)) {
-            printf("\n[minigdb] child terminated by signal %d\n",
-                   WTERMSIG(status));
-            break;
-        }
+        trim_newline(line);
 
-        if (!WIFSTOPPED(status)) {
+        char *saveptr = NULL;
+        char *command = strtok_r(line, " \t", &saveptr);
+        if (command == NULL) {
             continue;
         }
 
-        int sig = WSTOPSIG(status);
-        struct user_regs_struct regs;
-        if (get_registers(pid, &regs) == -1) {
-            return EXIT_FAILURE;
+        if (strcmp(command, "help") == 0 || strcmp(command, "h") == 0) {
+            print_help();
+            continue;
         }
 
-        if (sig == SIGTRAP && regs.rip > 0) {
-            uintptr_t candidate = (uintptr_t)(regs.rip - 1);
-            breakpoint_t *bp =
-                breakpoint_manager_find_by_address(&manager, candidate);
-
-            if (bp != NULL && bp->enabled) {
-                ++bp->hit_count;
-
-                printf("\n[minigdb] breakpoint #%d hit!\n", bp->id);
-                printf("[minigdb] symbol = %s\n", bp->symbol);
-                printf("[minigdb] address = 0x%lx\n",
-                       (unsigned long)bp->address);
-                printf("[minigdb] hit count = %lu\n", bp->hit_count);
-
-                print_registers(&regs);
-
-                if (recover_breakpoint(pid, bp) == -1) {
-                    return EXIT_FAILURE;
-                }
-
-                if (continue_debuggee(pid) == -1) {
-                    return EXIT_FAILURE;
-                }
-
-                printf("[minigdb] child continued\n");
+        if (strcmp(command, "break") == 0 || strcmp(command, "b") == 0) {
+            char *argument = strtok_r(NULL, " \t", &saveptr);
+            if (argument == NULL) {
+                printf("usage: break <symbol|address>\n");
                 continue;
             }
 
-            printf("\n[minigdb] SIGTRAP at RIP 0x%llx was not caused by "
-                   "a managed breakpoint\n",
-                   regs.rip);
-
-            if (continue_debuggee(pid) == -1) {
-                return EXIT_FAILURE;
+            if (add_breakpoint_from_text(pid,
+                                         &manager,
+                                         &image,
+                                         load_bias,
+                                         argument) == -1) {
+                printf("[minigdb] failed to create breakpoint\n");
             }
             continue;
         }
 
-        printf("\n[minigdb] child stopped by signal %d\n", sig);
-
-        if (ptrace(PTRACE_CONT,
-                   pid,
-                   NULL,
-                   (void *)(intptr_t)sig) == -1) {
-            perror("ptrace PTRACE_CONT");
-            return EXIT_FAILURE;
+        if (strcmp(command, "continue") == 0 || strcmp(command, "c") == 0) {
+            int result = continue_until_stop(pid, &manager);
+            if (result == -1) {
+                child_alive = 0;
+            } else if (result == 0) {
+                child_alive = 0;
+            }
+            continue;
         }
+
+        if (strcmp(command, "step") == 0 || strcmp(command, "s") == 0) {
+            struct user_regs_struct after;
+            if (single_step_once(pid, &after) == -1) {
+                child_alive = 0;
+            }
+            continue;
+        }
+
+        if (strcmp(command, "regs") == 0 || strcmp(command, "r") == 0) {
+            struct user_regs_struct regs;
+            if (get_registers(pid, &regs) == -1) {
+                child_alive = 0;
+            } else {
+                print_registers(&regs);
+            }
+            continue;
+        }
+
+        if (strcmp(command, "x") == 0) {
+            char *argument = strtok_r(NULL, " \t", &saveptr);
+            if (argument == NULL) {
+                printf("usage: x <address|rip>\n");
+                continue;
+            }
+
+            uintptr_t address;
+            if (strcmp(argument, "rip") == 0) {
+                struct user_regs_struct regs;
+                if (get_registers(pid, &regs) == -1) {
+                    child_alive = 0;
+                    continue;
+                }
+                address = (uintptr_t)regs.rip;
+            } else if (parse_runtime_address(argument, &address) == -1) {
+                printf("[minigdb] invalid address: %s\n", argument);
+                continue;
+            }
+
+            print_memory_word(pid, address);
+            continue;
+        }
+
+        if (strcmp(command, "info") == 0) {
+            char *argument = strtok_r(NULL, " \t", &saveptr);
+            if (argument == NULL) {
+                printf("usage: info breakpoints | info target\n");
+                continue;
+            }
+
+            if (strcmp(argument, "breakpoints") == 0 ||
+                strcmp(argument, "b") == 0) {
+                breakpoint_manager_print(&manager);
+                continue;
+            }
+
+            if (strcmp(argument, "target") == 0) {
+                printf("\n===== Target =====\n");
+                printf("Program   : %s\n", program_path);
+                printf("PID       : %d\n", pid);
+                printf("ELF type  : %s\n", elf_type_name(image.type));
+                printf("Load bias : 0x%lx\n", (unsigned long)load_bias);
+                printf("Symbols   : %zu\n", image.symbol_count);
+                printf("PHDRs     : %zu\n", image.program_header_count);
+                printf("==================\n\n");
+                continue;
+            }
+
+            printf("[minigdb] unknown info topic: %s\n", argument);
+            continue;
+        }
+
+        if (strcmp(command, "quit") == 0 || strcmp(command, "q") == 0) {
+            break;
+        }
+
+        printf("[minigdb] unknown command: %s\n", command);
+        printf("[minigdb] type 'help' to list commands\n");
+    }
+
+    if (child_alive) {
+        kill_debuggee(pid);
     }
 
     printf("\n[minigdb] final breakpoint statistics:\n");
     breakpoint_manager_print(&manager);
 
+    elf_image_destroy(&image);
     return EXIT_SUCCESS;
 }
