@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,8 +12,15 @@
 #include <unistd.h>
 
 
+typedef struct {
+    uintptr_t address;
+    unsigned char saved_byte;
+    int enabled;
+} breakpoint_t;
+
+
 /*
- * 從 stopped debuggee 取得 CPU registers。
+ * 取得 CPU registers。
  */
 static int get_registers(
     pid_t pid,
@@ -35,6 +43,29 @@ static int get_registers(
 
 
 /*
+ * 修改 CPU registers。
+ */
+static int set_registers(
+    pid_t pid,
+    const struct user_regs_struct *regs
+)
+{
+    if (ptrace(
+            PTRACE_SETREGS,
+            pid,
+            NULL,
+            regs
+        ) == -1) {
+
+        perror("ptrace PTRACE_SETREGS");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
  * 顯示 CPU registers。
  */
 static void print_registers(
@@ -44,9 +75,6 @@ static void print_registers(
     printf("\n");
     printf("===== CPU Registers =====\n");
 
-    /*
-     * General-purpose registers
-     */
     printf("RAX = 0x%016llx\n", regs->rax);
     printf("RBX = 0x%016llx\n", regs->rbx);
     printf("RCX = 0x%016llx\n", regs->rcx);
@@ -55,15 +83,9 @@ static void print_registers(
     printf("RSI = 0x%016llx\n", regs->rsi);
     printf("RDI = 0x%016llx\n", regs->rdi);
 
-    /*
-     * Stack related registers
-     */
     printf("RBP = 0x%016llx\n", regs->rbp);
     printf("RSP = 0x%016llx\n", regs->rsp);
 
-    /*
-     * x86-64 additional general-purpose registers
-     */
     printf("R8  = 0x%016llx\n", regs->r8);
     printf("R9  = 0x%016llx\n", regs->r9);
     printf("R10 = 0x%016llx\n", regs->r10);
@@ -75,48 +97,28 @@ static void print_registers(
 
     printf("\n");
 
-    /*
-     * RIP = instruction pointer
-     */
     printf("RIP = 0x%016llx\n", regs->rip);
-
-    /*
-     * CPU status flags
-     */
-    printf("EFLAGS = 0x%016llx\n", regs->eflags);
+    printf("RFLAGS = 0x%016llx\n", regs->eflags);
 
     printf("=========================\n\n");
 }
 
 
 /*
- * Chapter 4：
- *
- * 從 debuggee 的 virtual memory
- * 讀取一個 machine word。
- *
- * x86-64 Linux 上 long 通常為 8 bytes。
+ * 讀取 debuggee memory。
  */
 static int read_memory_word(
     pid_t pid,
-    unsigned long long address,
+    uintptr_t address,
     unsigned long *word
 )
 {
-    /*
-     * PTRACE_PEEKDATA 有一個特殊點：
-     *
-     * return -1 不一定代表 error，
-     * 因為 -1 本身也可能是合法 memory data。
-     *
-     * 所以必須先 errno = 0。
-     */
     errno = 0;
 
     long data = ptrace(
         PTRACE_PEEKDATA,
         pid,
-        (void *)(uintptr_t)address,
+        (void *)address,
         NULL
     );
 
@@ -133,48 +135,54 @@ static int read_memory_word(
 
 
 /*
- * 讀取 RIP 指向的 memory。
+ * Chapter 5：
  *
- * RIP 是目前 CPU instruction pointer，
- * 所以這裡通常會讀到 machine-code bytes。
+ * 寫入 debuggee memory。
  */
-static int print_memory_at_rip(
+static int write_memory_word(
     pid_t pid,
-    const struct user_regs_struct *regs
+    uintptr_t address,
+    unsigned long word
+)
+{
+    if (ptrace(
+            PTRACE_POKEDATA,
+            pid,
+            (void *)address,
+            (void *)(uintptr_t)word
+        ) == -1) {
+
+        perror("ptrace PTRACE_POKEDATA");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * 顯示某 address 的 machine word。
+ */
+static int print_memory_word(
+    pid_t pid,
+    uintptr_t address
 )
 {
     unsigned long word;
 
     if (read_memory_word(
             pid,
-            regs->rip,
+            address,
             &word
         ) == -1) {
 
         return -1;
     }
 
-    printf("===== Memory at RIP =====\n");
-
     printf(
-        "Address = 0x%016llx\n",
-        regs->rip
+        "Memory @ 0x%lx: ",
+        (unsigned long)address
     );
-
-    /*
-     * 把整個 8-byte word 當成整數顯示。
-     */
-    printf(
-        "Raw     = 0x%016lx\n",
-        word
-    );
-
-    /*
-     * 按照 memory address 順序顯示 byte。
-     *
-     * x86-64 是 little-endian。
-     */
-    printf("Bytes   = ");
 
     for (size_t i = 0; i < sizeof(word); i++) {
 
@@ -183,35 +191,134 @@ static int print_memory_at_rip(
                 (word >> (i * 8)) & 0xff
             );
 
-        printf(
-            "%02x ",
-            byte
-        );
+        printf("%02x ", byte);
     }
 
     printf("\n");
-    printf("=========================\n\n");
 
     return 0;
 }
 
 
 /*
- * 統一檢查目前 stopped process。
- *
- * Chapter 3：
- *     registers
- *
- * Chapter 4：
- *     memory at RIP
+ * 插入 INT3 breakpoint。
  */
-static int inspect_process(pid_t pid)
+static int breakpoint_enable(
+    pid_t pid,
+    breakpoint_t *bp
+)
+{
+    if (bp->enabled) {
+        return 0;
+    }
+
+    unsigned long word;
+
+    if (read_memory_word(
+            pid,
+            bp->address,
+            &word
+        ) == -1) {
+
+        return -1;
+    }
+
+    /*
+     * 保存原始第一個 byte。
+     */
+    bp->saved_byte =
+        (unsigned char)(word & 0xff);
+
+    /*
+     * lowest byte:
+     *
+     * original -> CC
+     */
+    unsigned long patched =
+        (word & ~0xffUL) | 0xccUL;
+
+    if (write_memory_word(
+            pid,
+            bp->address,
+            patched
+        ) == -1) {
+
+        return -1;
+    }
+
+    bp->enabled = 1;
+
+    printf(
+        "[minigdb] breakpoint enabled at 0x%lx\n",
+        (unsigned long)bp->address
+    );
+
+    printf(
+        "[minigdb] saved original byte: 0x%02x\n",
+        bp->saved_byte
+    );
+
+    return 0;
+}
+
+
+/*
+ * 恢復 breakpoint 原本 instruction byte。
+ */
+static int breakpoint_disable(
+    pid_t pid,
+    breakpoint_t *bp
+)
+{
+    if (!bp->enabled) {
+        return 0;
+    }
+
+    unsigned long word;
+
+    if (read_memory_word(
+            pid,
+            bp->address,
+            &word
+        ) == -1) {
+
+        return -1;
+    }
+
+    unsigned long restored =
+        (word & ~0xffUL)
+        | (unsigned long)bp->saved_byte;
+
+    if (write_memory_word(
+            pid,
+            bp->address,
+            restored
+        ) == -1) {
+
+        return -1;
+    }
+
+    bp->enabled = 0;
+
+    return 0;
+}
+
+
+/*
+ * Breakpoint hit 後：
+ *
+ * 1. RIP -= 1
+ * 2. restore original byte
+ * 3. single-step original instruction
+ * 4. reinstall breakpoint
+ */
+static int recover_breakpoint(
+    pid_t pid,
+    breakpoint_t *bp
+)
 {
     struct user_regs_struct regs;
 
-    /*
-     * 先取得 CPU snapshot。
-     */
     if (get_registers(
             pid,
             &regs
@@ -220,15 +327,23 @@ static int inspect_process(pid_t pid)
         return -1;
     }
 
-    /*
-     * Chapter 3
-     */
-    print_registers(&regs);
+    printf(
+        "[minigdb] RIP after INT3 = 0x%llx\n",
+        regs.rip
+    );
 
     /*
-     * Chapter 4
+     * INT3 是 1 byte，
+     * CPU 已經把 RIP 往前移了一格。
      */
-    if (print_memory_at_rip(
+    regs.rip -= 1;
+
+    printf(
+        "[minigdb] rewinding RIP to 0x%llx\n",
+        regs.rip
+    );
+
+    if (set_registers(
             pid,
             &regs
         ) == -1) {
@@ -236,18 +351,150 @@ static int inspect_process(pid_t pid)
         return -1;
     }
 
+    /*
+     * CC → original instruction byte
+     */
+    if (breakpoint_disable(
+            pid,
+            bp
+        ) == -1) {
+
+        return -1;
+    }
+
+    printf(
+        "[minigdb] original instruction restored\n"
+    );
+
+    /*
+     * 只執行原本的那一條 instruction。
+     */
+    if (ptrace(
+            PTRACE_SINGLESTEP,
+            pid,
+            NULL,
+            NULL
+        ) == -1) {
+
+        perror("ptrace PTRACE_SINGLESTEP");
+        return -1;
+    }
+
+    int status;
+
+    if (waitpid(
+            pid,
+            &status,
+            0
+        ) == -1) {
+
+        perror("waitpid");
+        return -1;
+    }
+
+    /*
+     * 正常情況：
+     *
+     * single-step 完成 → SIGTRAP
+     */
+    if (!WIFSTOPPED(status)) {
+
+        fprintf(
+            stderr,
+            "[minigdb] debuggee did not stop after single-step\n"
+        );
+
+        return -1;
+    }
+
+    printf(
+        "[minigdb] original instruction executed once\n"
+    );
+
+    /*
+     * 再次：
+     *
+     * original byte → CC
+     */
+    if (breakpoint_enable(
+            pid,
+            bp
+        ) == -1) {
+
+        return -1;
+    }
+
+    printf(
+        "[minigdb] breakpoint reinstalled\n"
+    );
+
     return 0;
 }
 
 
-int main(void)
+int main(
+    int argc,
+    char *argv[]
+)
 {
     /*
-     * fork() 之後：
+     * Chapter 5 暫時使用 raw address。
      *
-     * parent -> debugger
-     * child  -> debuggee
+     * Example:
+     *
+     * ./minigdb 0x401126
      */
+    if (argc != 2) {
+
+        fprintf(
+            stderr,
+            "Usage: %s <breakpoint-address>\n",
+            argv[0]
+        );
+
+        return EXIT_FAILURE;
+    }
+
+
+    /*
+     * 把：
+     *
+     * "0x401126"
+     *
+     * 轉成 integer address。
+     */
+    errno = 0;
+
+    char *end = NULL;
+
+    unsigned long long parsed_address =
+        strtoull(
+            argv[1],
+            &end,
+            0
+        );
+
+    if (errno != 0 ||
+        end == argv[1] ||
+        *end != '\0') {
+
+        fprintf(
+            stderr,
+            "Invalid breakpoint address: %s\n",
+            argv[1]
+        );
+
+        return EXIT_FAILURE;
+    }
+
+
+    breakpoint_t breakpoint = {
+        .address = (uintptr_t)parsed_address,
+        .saved_byte = 0,
+        .enabled = 0
+    };
+
+
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -262,11 +509,6 @@ int main(void)
      */
     if (pid == 0) {
 
-        /*
-         * 告訴 kernel：
-         *
-         * parent 可以 trace 我。
-         */
         if (ptrace(
                 PTRACE_TRACEME,
                 0,
@@ -278,18 +520,12 @@ int main(void)
             _exit(EXIT_FAILURE);
         }
 
-        /*
-         * 用 ./hello 取代 child。
-         */
         execl(
             "./hello",
             "./hello",
             NULL
         );
 
-        /*
-         * exec 成功不會回到這裡。
-         */
         perror("execl");
         _exit(EXIT_FAILURE);
     }
@@ -298,7 +534,6 @@ int main(void)
     /*
      * Parent = debugger
      */
-
     printf(
         "[minigdb] child pid = %d\n",
         pid
@@ -308,7 +543,7 @@ int main(void)
 
 
     /*
-     * 等待 exec 後的 initial stop。
+     * 等 initial exec SIGTRAP。
      */
     if (waitpid(
             pid,
@@ -321,32 +556,62 @@ int main(void)
     }
 
 
-    /*
-     * Debuggee 現在 STOPPED。
-     */
-    if (WIFSTOPPED(status)) {
+    if (!WIFSTOPPED(status)) {
 
-        printf(
-            "[minigdb] child stopped by signal %d\n",
-            WSTOPSIG(status)
+        fprintf(
+            stderr,
+            "[minigdb] child did not stop after exec\n"
         );
 
-        /*
-         * Chapter 3 + Chapter 4
-         *
-         * Registers
-         * +
-         * Memory
-         */
-        if (inspect_process(pid) == -1) {
+        return EXIT_FAILURE;
+    }
 
-            return EXIT_FAILURE;
-        }
+
+    printf(
+        "[minigdb] initial stop signal = %d\n",
+        WSTOPSIG(status)
+    );
+
+
+    /*
+     * 設定 breakpoint 前先看看原始 bytes。
+     */
+    printf("\nBefore breakpoint:\n");
+
+    if (print_memory_word(
+            pid,
+            breakpoint.address
+        ) == -1) {
+
+        return EXIT_FAILURE;
     }
 
 
     /*
-     * 讓 child 繼續執行。
+     * original byte → CC
+     */
+    if (breakpoint_enable(
+            pid,
+            &breakpoint
+        ) == -1) {
+
+        return EXIT_FAILURE;
+    }
+
+
+    printf("\nAfter breakpoint:\n");
+
+    if (print_memory_word(
+            pid,
+            breakpoint.address
+        ) == -1) {
+
+        return EXIT_FAILURE;
+    }
+
+
+    /*
+     * 讓 debuggee 跑到 breakpoint。
      */
     if (ptrace(
             PTRACE_CONT,
@@ -359,13 +624,14 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+
     printf(
-        "[minigdb] child continued\n"
+        "\n[minigdb] child continued\n"
     );
 
 
     /*
-     * 等待下一次 process event。
+     * 等待 breakpoint SIGTRAP。
      */
     if (waitpid(
             pid,
@@ -378,51 +644,125 @@ int main(void)
     }
 
 
+    if (!WIFSTOPPED(status)) {
+
+        fprintf(
+            stderr,
+            "[minigdb] child did not stop at breakpoint\n"
+        );
+
+        return EXIT_FAILURE;
+    }
+
+
+    struct user_regs_struct regs;
+
+    if (get_registers(
+            pid,
+            &regs
+        ) == -1) {
+
+        return EXIT_FAILURE;
+    }
+
+
     /*
-     * 正常退出。
+     * 判斷是不是我們的 breakpoint。
+     *
+     * INT3 後：
+     *
+     * RIP = breakpoint + 1
      */
+    if (WSTOPSIG(status) == SIGTRAP &&
+        regs.rip - 1 == breakpoint.address) {
+
+        printf(
+            "\n[minigdb] breakpoint hit!\n"
+        );
+
+        printf(
+            "[minigdb] breakpoint address = 0x%lx\n",
+            (unsigned long)breakpoint.address
+        );
+
+        print_registers(&regs);
+
+
+        /*
+         * Breakpoint recovery。
+         */
+        if (recover_breakpoint(
+                pid,
+                &breakpoint
+            ) == -1) {
+
+            return EXIT_FAILURE;
+        }
+    }
+
+    else {
+
+        fprintf(
+            stderr,
+            "[minigdb] unexpected stop\n"
+        );
+
+        return EXIT_FAILURE;
+    }
+
+
+    /*
+     * Recovery 完成，
+     * 讓程式繼續執行。
+     */
+    if (ptrace(
+            PTRACE_CONT,
+            pid,
+            NULL,
+            NULL
+        ) == -1) {
+
+        perror("ptrace PTRACE_CONT");
+        return EXIT_FAILURE;
+    }
+
+
+    /*
+     * hello 正常情況會 exit。
+     */
+    if (waitpid(
+            pid,
+            &status,
+            0
+        ) == -1) {
+
+        perror("waitpid");
+        return EXIT_FAILURE;
+    }
+
+
     if (WIFEXITED(status)) {
 
         printf(
-            "[minigdb] child exited with code %d\n",
+            "\n[minigdb] child exited with code %d\n",
             WEXITSTATUS(status)
         );
     }
 
-
-    /*
-     * 被 signal 終止。
-     */
     else if (WIFSIGNALED(status)) {
 
         printf(
-            "[minigdb] child terminated by signal %d\n",
+            "\n[minigdb] child terminated by signal %d\n",
             WTERMSIG(status)
         );
     }
 
-
-    /*
-     * 再次停止。
-     */
     else if (WIFSTOPPED(status)) {
 
         printf(
-            "[minigdb] child stopped again by signal %d\n",
+            "\n[minigdb] child stopped again by signal %d\n",
             WSTOPSIG(status)
         );
-
-        /*
-         * 再次查看：
-         *
-         * CPU registers
-         * +
-         * RIP memory
-         */
-        if (inspect_process(pid) == -1) {
-
-            return EXIT_FAILURE;
-        }
     }
 
 
