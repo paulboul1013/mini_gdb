@@ -1,7 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
 #include <elf.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +14,10 @@
 #include <sys/wait.h>
 
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define MAX_BREAKPOINTS 32
 #define MAX_SYMBOL_NAME 128
@@ -341,28 +347,46 @@ static int continue_debuggee(pid_t pid)
 }
 
 /*
- * Chapter 7: minimal ELF64 symbol-table loader.
+ * Chapter 8: ELF64 image + PIE/ASLR runtime-address resolution.
  *
- * This chapter deliberately supports non-PIE x86-64 executables only.
- * For ET_EXEC, st_value from .symtab is the runtime virtual address used
- * by the breakpoint engine. PIE/ASLR relocation is intentionally deferred
- * to a later chapter.
+ * Chapter 7 resolved:
+ *
+ *     symbol name -> Elf64_Sym.st_value
+ *
+ * That works directly for a traditional ET_EXEC executable.  A PIE executable
+ * is normally ET_DYN, and ASLR chooses a different runtime load address on each
+ * execution.  For ET_DYN we therefore resolve:
+ *
+ *     runtime address = load bias + st_value
+ *
+ * The load bias is recovered by matching one ELF PT_LOAD segment against the
+ * corresponding mapping in /proc/<pid>/maps.
  */
 typedef struct {
+    Elf64_Half type;
+
     Elf64_Sym *symbols;
     size_t symbol_count;
+
     char *strtab;
     size_t strtab_size;
-} elf_symbol_table_t;
 
-static void elf_symbol_table_destroy(elf_symbol_table_t *table)
+    Elf64_Phdr *program_headers;
+    size_t program_header_count;
+} elf_image_t;
+
+typedef struct {
+    char symbol[MAX_SYMBOL_NAME];
+    uintptr_t elf_value;
+} symbol_request_t;
+
+static void elf_image_destroy(elf_image_t *image)
 {
-    free(table->symbols);
-    free(table->strtab);
-    table->symbols = NULL;
-    table->strtab = NULL;
-    table->symbol_count = 0;
-    table->strtab_size = 0;
+    free(image->symbols);
+    free(image->strtab);
+    free(image->program_headers);
+
+    memset(image, 0, sizeof(*image));
 }
 
 static int read_file_region(FILE *fp, long offset, void *buffer, size_t size)
@@ -380,11 +404,21 @@ static int read_file_region(FILE *fp, long offset, void *buffer, size_t size)
     return 0;
 }
 
-static int elf_symbol_table_load(
-    const char *path,
-    elf_symbol_table_t *table)
+static const char *elf_type_name(Elf64_Half type)
 {
-    memset(table, 0, sizeof(*table));
+    switch (type) {
+    case ET_EXEC:
+        return "ET_EXEC";
+    case ET_DYN:
+        return "ET_DYN";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static int elf_image_load(const char *path, elf_image_t *image)
+{
+    memset(image, 0, sizeof(*image));
 
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -406,7 +440,7 @@ static int elf_symbol_table_load(
     }
 
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "[minigdb] only ELF64 is supported in Chapter 7\n");
+        fprintf(stderr, "[minigdb] only ELF64 is supported in Chapter 8\n");
         fclose(fp);
         return -1;
     }
@@ -423,10 +457,10 @@ static int elf_symbol_table_load(
         return -1;
     }
 
-    if (ehdr.e_type != ET_EXEC) {
+    if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
         fprintf(stderr,
-                "[minigdb] Chapter 7 expects a non-PIE ET_EXEC executable.\n"
-                "[minigdb] rebuild hello with -fno-pie -no-pie.\n");
+                "[minigdb] unsupported ELF type: %u (need ET_EXEC or ET_DYN)\n",
+                (unsigned int)ehdr.e_type);
         fclose(fp);
         return -1;
     }
@@ -434,6 +468,13 @@ static int elf_symbol_table_load(
     if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0 ||
         ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
         fprintf(stderr, "[minigdb] unsupported or missing ELF section table\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
+        ehdr.e_phentsize != sizeof(Elf64_Phdr)) {
+        fprintf(stderr, "[minigdb] unsupported or missing ELF program-header table\n");
         fclose(fp);
         return -1;
     }
@@ -458,6 +499,28 @@ static int elf_symbol_table_load(
         return -1;
     }
 
+    Elf64_Phdr *program_headers =
+        calloc((size_t)ehdr.e_phnum, sizeof(Elf64_Phdr));
+    if (program_headers == NULL) {
+        perror("calloc program headers");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    size_t phdrs_size =
+        (size_t)ehdr.e_phnum * sizeof(Elf64_Phdr);
+
+    if (read_file_region(fp,
+                         (long)ehdr.e_phoff,
+                         program_headers,
+                         phdrs_size) == -1) {
+        free(program_headers);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
     const Elf64_Shdr *symtab_section = NULL;
     for (size_t i = 0; i < (size_t)ehdr.e_shnum; ++i) {
         if (sections[i].sh_type == SHT_SYMTAB) {
@@ -471,6 +534,7 @@ static int elf_symbol_table_load(
                 "[minigdb] no .symtab/SHT_SYMTAB found in %s\n"
                 "[minigdb] the executable may have been stripped.\n",
                 path);
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -478,6 +542,7 @@ static int elf_symbol_table_load(
 
     if (symtab_section->sh_link >= ehdr.e_shnum) {
         fprintf(stderr, "[minigdb] invalid symbol string-table link\n");
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -488,6 +553,7 @@ static int elf_symbol_table_load(
 
     if (strtab_section->sh_type != SHT_STRTAB) {
         fprintf(stderr, "[minigdb] symbol table does not link to a string table\n");
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -496,6 +562,7 @@ static int elf_symbol_table_load(
     if (symtab_section->sh_entsize != sizeof(Elf64_Sym) ||
         symtab_section->sh_size % sizeof(Elf64_Sym) != 0) {
         fprintf(stderr, "[minigdb] unsupported ELF64 symbol-table layout\n");
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -508,6 +575,7 @@ static int elf_symbol_table_load(
         malloc(symbol_count * sizeof(Elf64_Sym));
     if (symbols == NULL && symbol_count != 0) {
         perror("malloc symbols");
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -518,6 +586,7 @@ static int elf_symbol_table_load(
     if (strtab == NULL) {
         perror("malloc string table");
         free(symbols);
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -533,6 +602,7 @@ static int elf_symbol_table_load(
                          strtab_size) == -1) {
         free(strtab);
         free(symbols);
+        free(program_headers);
         free(sections);
         fclose(fp);
         return -1;
@@ -540,28 +610,36 @@ static int elf_symbol_table_load(
 
     strtab[strtab_size] = '\0';
 
-    table->symbols = symbols;
-    table->symbol_count = symbol_count;
-    table->strtab = strtab;
-    table->strtab_size = strtab_size;
+    image->type = ehdr.e_type;
+    image->symbols = symbols;
+    image->symbol_count = symbol_count;
+    image->strtab = strtab;
+    image->strtab_size = strtab_size;
+    image->program_headers = program_headers;
+    image->program_header_count = (size_t)ehdr.e_phnum;
 
     free(sections);
     fclose(fp);
 
-    printf("[minigdb] loaded ELF64 symbol table from %s (%zu symbols)\n",
+    printf("[minigdb] loaded ELF64 image from %s (%zu symbols, %zu program headers)\n",
            path,
-           table->symbol_count);
+           image->symbol_count,
+           image->program_header_count);
+
+    printf("[minigdb] ELF type = %s%s\n",
+           elf_type_name(image->type),
+           image->type == ET_DYN ? " (PIE/shared-object style image)" : "");
 
     return 0;
 }
 
 static int elf_find_function(
-    const elf_symbol_table_t *table,
+    const elf_image_t *image,
     const char *symbol_name,
-    uintptr_t *address)
+    uintptr_t *elf_value)
 {
-    for (size_t i = 0; i < table->symbol_count; ++i) {
-        const Elf64_Sym *sym = &table->symbols[i];
+    for (size_t i = 0; i < image->symbol_count; ++i) {
+        const Elf64_Sym *sym = &image->symbols[i];
 
         if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC) {
             continue;
@@ -571,13 +649,13 @@ static int elf_find_function(
             continue;
         }
 
-        if ((size_t)sym->st_name >= table->strtab_size) {
+        if ((size_t)sym->st_name >= image->strtab_size) {
             continue;
         }
 
-        const char *name = table->strtab + sym->st_name;
+        const char *name = image->strtab + sym->st_name;
         if (strcmp(name, symbol_name) == 0) {
-            *address = (uintptr_t)sym->st_value;
+            *elf_value = (uintptr_t)sym->st_value;
             return 0;
         }
     }
@@ -585,12 +663,186 @@ static int elf_find_function(
     return -1;
 }
 
+static uintptr_t align_down_uintptr(uintptr_t value, uintptr_t alignment)
+{
+    return value - (value % alignment);
+}
+
+/*
+ * Read /proc/<pid>/exe instead of trying to guess how the relative path
+ * "./hello" appears in /proc/<pid>/maps.  The proc symlink gives us the
+ * canonical executable path used by the traced process.
+ */
+static int get_process_executable_path(
+    pid_t pid,
+    char *buffer,
+    size_t buffer_size)
+{
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", pid);
+
+    ssize_t length = readlink(proc_path, buffer, buffer_size - 1);
+    if (length == -1) {
+        perror("readlink /proc/<pid>/exe");
+        return -1;
+    }
+
+    buffer[length] = '\0';
+    return 0;
+}
+
+/*
+ * Match an ELF PT_LOAD segment with the corresponding /proc/<pid>/maps row.
+ *
+ * For a mapping that corresponds to one PT_LOAD segment:
+ *
+ *     mapping_start = load_bias + page_align_down(p_vaddr)
+ *
+ * therefore:
+ *
+ *     load_bias = mapping_start - page_align_down(p_vaddr)
+ */
+static int find_runtime_load_bias(
+    pid_t pid,
+    const elf_image_t *image,
+    uintptr_t *load_bias)
+{
+    if (image->type == ET_EXEC) {
+        *load_bias = 0;
+        return 0;
+    }
+
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        fprintf(stderr, "[minigdb] failed to determine page size\n");
+        return -1;
+    }
+
+    uintptr_t page_size = (uintptr_t)page_size_long;
+
+    char exe_path[PATH_MAX];
+    if (get_process_executable_path(pid, exe_path, sizeof(exe_path)) == -1) {
+        return -1;
+    }
+
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+
+    FILE *maps = fopen(maps_path, "r");
+    if (maps == NULL) {
+        perror("fopen /proc/<pid>/maps");
+        return -1;
+    }
+
+    char line[PATH_MAX + 256];
+
+    while (fgets(line, sizeof(line), maps) != NULL) {
+        unsigned long map_start = 0;
+        unsigned long map_end = 0;
+        unsigned long map_offset = 0;
+        unsigned long inode = 0;
+        char permissions[5] = {0};
+        char device[32] = {0};
+        int path_offset = 0;
+
+        int fields = sscanf(line,
+                            "%lx-%lx %4s %lx %31s %lu %n",
+                            &map_start,
+                            &map_end,
+                            permissions,
+                            &map_offset,
+                            device,
+                            &inode,
+                            &path_offset);
+
+        (void)map_end;
+        (void)permissions;
+        (void)device;
+        (void)inode;
+
+        if (fields != 6 || path_offset <= 0) {
+            continue;
+        }
+
+        char *mapped_path = line + path_offset;
+        while (*mapped_path == ' ' || *mapped_path == '\t') {
+            ++mapped_path;
+        }
+
+        size_t path_length = strlen(mapped_path);
+        while (path_length > 0 &&
+               (mapped_path[path_length - 1] == '\n' ||
+                mapped_path[path_length - 1] == '\r')) {
+            mapped_path[--path_length] = '\0';
+        }
+
+        if (strcmp(mapped_path, exe_path) != 0) {
+            continue;
+        }
+
+        for (size_t i = 0; i < image->program_header_count; ++i) {
+            const Elf64_Phdr *phdr = &image->program_headers[i];
+
+            if (phdr->p_type != PT_LOAD) {
+                continue;
+            }
+
+            uintptr_t segment_file_page =
+                align_down_uintptr((uintptr_t)phdr->p_offset, page_size);
+            uintptr_t segment_vaddr_page =
+                align_down_uintptr((uintptr_t)phdr->p_vaddr, page_size);
+
+            if ((uintptr_t)map_offset != segment_file_page) {
+                continue;
+            }
+
+            if ((uintptr_t)map_start < segment_vaddr_page) {
+                continue;
+            }
+
+            *load_bias = (uintptr_t)map_start - segment_vaddr_page;
+
+            printf("[minigdb] matched PT_LOAD: "
+                   "file offset 0x%lx, ELF vaddr 0x%lx, map start 0x%lx\n",
+                   (unsigned long)segment_file_page,
+                   (unsigned long)segment_vaddr_page,
+                   map_start);
+            printf("[minigdb] executable mapping = %s\n", mapped_path);
+
+            fclose(maps);
+            return 0;
+        }
+    }
+
+    fclose(maps);
+
+    fprintf(stderr,
+            "[minigdb] could not match %s PT_LOAD segments with %s\n",
+            exe_path,
+            maps_path);
+    return -1;
+}
+
+static uintptr_t elf_value_to_runtime_address(
+    const elf_image_t *image,
+    uintptr_t elf_value,
+    uintptr_t load_bias)
+{
+    if (image->type == ET_DYN) {
+        return load_bias + elf_value;
+    }
+
+    return elf_value;
+}
+
 int main(int argc, char *argv[])
 {
     /*
-     * Chapter 7 accepts function symbol names instead of raw addresses:
+     * Chapter 8 still accepts function symbol names:
      *
-     *   ./minigdb foo main
+     *     ./minigdb main foo
+     *
+     * Unlike Chapter 7, ./hello may now be a normal PIE executable.
      */
     if (argc < 2) {
         fprintf(stderr,
@@ -599,43 +851,46 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    elf_symbol_table_t elf_symbols;
-    if (elf_symbol_table_load(PROGRAM_PATH, &elf_symbols) == -1) {
+    if (argc - 1 > MAX_BREAKPOINTS) {
+        fprintf(stderr,
+                "[minigdb] too many requested breakpoints (max = %d)\n",
+                MAX_BREAKPOINTS);
         return EXIT_FAILURE;
     }
 
-    breakpoint_manager_t manager;
-    breakpoint_manager_init(&manager);
+    elf_image_t image;
+    if (elf_image_load(PROGRAM_PATH, &image) == -1) {
+        return EXIT_FAILURE;
+    }
 
-    printf("\n[minigdb] resolving function symbols:\n");
+    symbol_request_t requests[MAX_BREAKPOINTS];
+    size_t request_count = 0;
+
+    printf("\n[minigdb] ELF symbol values:\n");
 
     for (int i = 1; i < argc; ++i) {
-        uintptr_t address;
-        if (elf_find_function(&elf_symbols, argv[i], &address) == -1) {
+        uintptr_t elf_value;
+        if (elf_find_function(&image, argv[i], &elf_value) == -1) {
             fprintf(stderr,
                     "[minigdb] function symbol not found: %s\n",
                     argv[i]);
-            elf_symbol_table_destroy(&elf_symbols);
+            elf_image_destroy(&image);
             return EXIT_FAILURE;
         }
+
+        symbol_request_t *request = &requests[request_count++];
+        snprintf(request->symbol, sizeof(request->symbol), "%s", argv[i]);
+        request->elf_value = elf_value;
 
         printf("[minigdb]   %-20s -> 0x%lx\n",
-               argv[i],
-               (unsigned long)address);
-
-        breakpoint_t *bp =
-            breakpoint_manager_add(&manager, address, argv[i]);
-        if (bp == NULL) {
-            elf_symbol_table_destroy(&elf_symbols);
-            return EXIT_FAILURE;
-        }
+               request->symbol,
+               (unsigned long)request->elf_value);
     }
-
-    elf_symbol_table_destroy(&elf_symbols);
 
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
 
@@ -655,15 +910,55 @@ int main(int argc, char *argv[])
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         perror("waitpid");
+        elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
 
     if (!WIFSTOPPED(status)) {
         fprintf(stderr, "[minigdb] child did not stop after exec\n");
+        elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
 
     printf("[minigdb] initial stop signal = %d\n", WSTOPSIG(status));
+
+    uintptr_t load_bias;
+    if (find_runtime_load_bias(pid, &image, &load_bias) == -1) {
+        elf_image_destroy(&image);
+        return EXIT_FAILURE;
+    }
+
+    printf("[minigdb] runtime load bias = 0x%lx\n",
+           (unsigned long)load_bias);
+
+    breakpoint_manager_t manager;
+    breakpoint_manager_init(&manager);
+
+    printf("\n[minigdb] runtime symbol addresses:\n");
+
+    for (size_t i = 0; i < request_count; ++i) {
+        uintptr_t runtime_address =
+            elf_value_to_runtime_address(&image,
+                                         requests[i].elf_value,
+                                         load_bias);
+
+        printf("[minigdb]   %-20s -> 0x%lx "
+               "(ELF value 0x%lx)\n",
+               requests[i].symbol,
+               (unsigned long)runtime_address,
+               (unsigned long)requests[i].elf_value);
+
+        breakpoint_t *bp =
+            breakpoint_manager_add(&manager,
+                                   runtime_address,
+                                   requests[i].symbol);
+        if (bp == NULL) {
+            elf_image_destroy(&image);
+            return EXIT_FAILURE;
+        }
+    }
+
+    elf_image_destroy(&image);
 
     printf("\n[minigdb] configured breakpoint manager:\n");
     breakpoint_manager_print(&manager);
@@ -691,8 +986,8 @@ int main(int argc, char *argv[])
     printf("[minigdb] child continued\n");
 
     /*
-     * Chapter 6/7 event loop:
-     * wait for breakpoint hits until the debuggee exits.
+     * Chapter 6/7/8 event loop:
+     * breakpoint handling is unchanged because it only needs runtime addresses.
      */
     for (;;) {
         if (waitpid(pid, &status, 0) == -1) {
@@ -760,10 +1055,6 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /*
-         * For non-SIGTRAP stops, report the signal and deliver it to the
-         * debuggee when continuing.  This lets a real crash remain a crash.
-         */
         printf("\n[minigdb] child stopped by signal %d\n", sig);
 
         if (ptrace(PTRACE_CONT,
