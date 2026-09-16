@@ -1,8 +1,10 @@
+#include <elf.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <sys/ptrace.h>
 #include <sys/types.h>
@@ -12,6 +14,8 @@
 #include <unistd.h>
 
 #define MAX_BREAKPOINTS 32
+#define MAX_SYMBOL_NAME 128
+#define PROGRAM_PATH "./hello"
 
 typedef struct {
     int id;
@@ -19,6 +23,7 @@ typedef struct {
     unsigned char saved_byte;
     int enabled;
     unsigned long hit_count;
+    char symbol[MAX_SYMBOL_NAME];
 } breakpoint_t;
 
 typedef struct {
@@ -129,7 +134,8 @@ static breakpoint_t *breakpoint_manager_find_by_address(
 
 static breakpoint_t *breakpoint_manager_add(
     breakpoint_manager_t *manager,
-    uintptr_t address)
+    uintptr_t address,
+    const char *symbol)
 {
     breakpoint_t *existing = breakpoint_manager_find_by_address(manager, address);
     if (existing != NULL) {
@@ -149,24 +155,26 @@ static breakpoint_t *breakpoint_manager_add(
     bp->saved_byte = 0;
     bp->enabled = 0;
     bp->hit_count = 0;
+    snprintf(bp->symbol, sizeof(bp->symbol), "%s", symbol);
     return bp;
 }
 
 static void breakpoint_manager_print(const breakpoint_manager_t *manager)
 {
     printf("\n===== Breakpoints =====\n");
-    printf("ID   Address             Enabled   Hits\n");
+    printf("ID   Symbol               Address             Enabled   Hits\n");
 
     for (size_t i = 0; i < manager->count; ++i) {
         const breakpoint_t *bp = &manager->items[i];
-        printf("%-4d 0x%016lx %-9s %lu\n",
+        printf("%-4d %-20s 0x%016lx %-9s %lu\n",
                bp->id,
+               bp->symbol,
                (unsigned long)bp->address,
                bp->enabled ? "yes" : "no",
                bp->hit_count);
     }
 
-    printf("=======================\n\n");
+    printf("============================================================\n\n");
 }
 
 static int breakpoint_enable(pid_t pid, breakpoint_t *bp)
@@ -231,7 +239,7 @@ static int breakpoint_manager_enable_all(pid_t pid, breakpoint_manager_t *manage
 }
 
 /*
- * Chapter 6: reusable machine-instruction single-step primitive.
+ * Chapter 6/7: reusable machine-instruction single-step primitive.
  *
  * Exactly one CPU instruction is executed.  The traced process should then
  * stop with SIGTRAP, and we show the RIP transition so the step is visible.
@@ -332,49 +340,298 @@ static int continue_debuggee(pid_t pid)
     return 0;
 }
 
-static int parse_address(const char *text, uintptr_t *address)
-{
-    errno = 0;
-    char *end = NULL;
-    unsigned long long value = strtoull(text, &end, 0);
+/*
+ * Chapter 7: minimal ELF64 symbol-table loader.
+ *
+ * This chapter deliberately supports non-PIE x86-64 executables only.
+ * For ET_EXEC, st_value from .symtab is the runtime virtual address used
+ * by the breakpoint engine. PIE/ASLR relocation is intentionally deferred
+ * to a later chapter.
+ */
+typedef struct {
+    Elf64_Sym *symbols;
+    size_t symbol_count;
+    char *strtab;
+    size_t strtab_size;
+} elf_symbol_table_t;
 
-    if (errno != 0 || end == text || *end != '\0') {
+static void elf_symbol_table_destroy(elf_symbol_table_t *table)
+{
+    free(table->symbols);
+    free(table->strtab);
+    table->symbols = NULL;
+    table->strtab = NULL;
+    table->symbol_count = 0;
+    table->strtab_size = 0;
+}
+
+static int read_file_region(FILE *fp, long offset, void *buffer, size_t size)
+{
+    if (fseek(fp, offset, SEEK_SET) != 0) {
+        perror("fseek");
         return -1;
     }
 
-    *address = (uintptr_t)value;
+    if (size != 0 && fread(buffer, 1, size, fp) != size) {
+        fprintf(stderr, "[minigdb] failed to read ELF file region\n");
+        return -1;
+    }
+
     return 0;
+}
+
+static int elf_symbol_table_load(
+    const char *path,
+    elf_symbol_table_t *table)
+{
+    memset(table, 0, sizeof(*table));
+
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        perror("fopen ELF");
+        return -1;
+    }
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, 1, sizeof(ehdr), fp) != sizeof(ehdr)) {
+        fprintf(stderr, "[minigdb] failed to read ELF header from %s\n", path);
+        fclose(fp);
+        return -1;
+    }
+
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "[minigdb] %s is not an ELF file\n", path);
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "[minigdb] only ELF64 is supported in Chapter 7\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
+        fprintf(stderr, "[minigdb] only little-endian ELF is supported\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_machine != EM_X86_64) {
+        fprintf(stderr, "[minigdb] only x86-64 ELF is supported\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_type != ET_EXEC) {
+        fprintf(stderr,
+                "[minigdb] Chapter 7 expects a non-PIE ET_EXEC executable.\n"
+                "[minigdb] rebuild hello with -fno-pie -no-pie.\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0 ||
+        ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+        fprintf(stderr, "[minigdb] unsupported or missing ELF section table\n");
+        fclose(fp);
+        return -1;
+    }
+
+    Elf64_Shdr *sections =
+        calloc((size_t)ehdr.e_shnum, sizeof(Elf64_Shdr));
+    if (sections == NULL) {
+        perror("calloc section headers");
+        fclose(fp);
+        return -1;
+    }
+
+    size_t sections_size =
+        (size_t)ehdr.e_shnum * sizeof(Elf64_Shdr);
+
+    if (read_file_region(fp,
+                         (long)ehdr.e_shoff,
+                         sections,
+                         sections_size) == -1) {
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    const Elf64_Shdr *symtab_section = NULL;
+    for (size_t i = 0; i < (size_t)ehdr.e_shnum; ++i) {
+        if (sections[i].sh_type == SHT_SYMTAB) {
+            symtab_section = &sections[i];
+            break;
+        }
+    }
+
+    if (symtab_section == NULL) {
+        fprintf(stderr,
+                "[minigdb] no .symtab/SHT_SYMTAB found in %s\n"
+                "[minigdb] the executable may have been stripped.\n",
+                path);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    if (symtab_section->sh_link >= ehdr.e_shnum) {
+        fprintf(stderr, "[minigdb] invalid symbol string-table link\n");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    const Elf64_Shdr *strtab_section =
+        &sections[symtab_section->sh_link];
+
+    if (strtab_section->sh_type != SHT_STRTAB) {
+        fprintf(stderr, "[minigdb] symbol table does not link to a string table\n");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    if (symtab_section->sh_entsize != sizeof(Elf64_Sym) ||
+        symtab_section->sh_size % sizeof(Elf64_Sym) != 0) {
+        fprintf(stderr, "[minigdb] unsupported ELF64 symbol-table layout\n");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    size_t symbol_count =
+        (size_t)(symtab_section->sh_size / sizeof(Elf64_Sym));
+
+    Elf64_Sym *symbols =
+        malloc(symbol_count * sizeof(Elf64_Sym));
+    if (symbols == NULL && symbol_count != 0) {
+        perror("malloc symbols");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    size_t strtab_size = (size_t)strtab_section->sh_size;
+    char *strtab = malloc(strtab_size + 1);
+    if (strtab == NULL) {
+        perror("malloc string table");
+        free(symbols);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    if (read_file_region(fp,
+                         (long)symtab_section->sh_offset,
+                         symbols,
+                         symbol_count * sizeof(Elf64_Sym)) == -1 ||
+        read_file_region(fp,
+                         (long)strtab_section->sh_offset,
+                         strtab,
+                         strtab_size) == -1) {
+        free(strtab);
+        free(symbols);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    strtab[strtab_size] = '\0';
+
+    table->symbols = symbols;
+    table->symbol_count = symbol_count;
+    table->strtab = strtab;
+    table->strtab_size = strtab_size;
+
+    free(sections);
+    fclose(fp);
+
+    printf("[minigdb] loaded ELF64 symbol table from %s (%zu symbols)\n",
+           path,
+           table->symbol_count);
+
+    return 0;
+}
+
+static int elf_find_function(
+    const elf_symbol_table_t *table,
+    const char *symbol_name,
+    uintptr_t *address)
+{
+    for (size_t i = 0; i < table->symbol_count; ++i) {
+        const Elf64_Sym *sym = &table->symbols[i];
+
+        if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC) {
+            continue;
+        }
+
+        if (sym->st_shndx == SHN_UNDEF) {
+            continue;
+        }
+
+        if ((size_t)sym->st_name >= table->strtab_size) {
+            continue;
+        }
+
+        const char *name = table->strtab + sym->st_name;
+        if (strcmp(name, symbol_name) == 0) {
+            *address = (uintptr_t)sym->st_value;
+            return 0;
+        }
+    }
+
+    return -1;
 }
 
 int main(int argc, char *argv[])
 {
     /*
-     * Chapter 6 accepts multiple raw breakpoint addresses:
+     * Chapter 7 accepts function symbol names instead of raw addresses:
      *
-     *   ./minigdb 0x401136 0x401150
+     *   ./minigdb foo main
      */
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s <breakpoint-address> [breakpoint-address ...]\n",
+                "Usage: %s <function-symbol> [function-symbol ...]\n",
                 argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    elf_symbol_table_t elf_symbols;
+    if (elf_symbol_table_load(PROGRAM_PATH, &elf_symbols) == -1) {
         return EXIT_FAILURE;
     }
 
     breakpoint_manager_t manager;
     breakpoint_manager_init(&manager);
 
+    printf("\n[minigdb] resolving function symbols:\n");
+
     for (int i = 1; i < argc; ++i) {
         uintptr_t address;
-        if (parse_address(argv[i], &address) == -1) {
-            fprintf(stderr, "Invalid breakpoint address: %s\n", argv[i]);
+        if (elf_find_function(&elf_symbols, argv[i], &address) == -1) {
+            fprintf(stderr,
+                    "[minigdb] function symbol not found: %s\n",
+                    argv[i]);
+            elf_symbol_table_destroy(&elf_symbols);
             return EXIT_FAILURE;
         }
 
-        breakpoint_t *bp = breakpoint_manager_add(&manager, address);
+        printf("[minigdb]   %-20s -> 0x%lx\n",
+               argv[i],
+               (unsigned long)address);
+
+        breakpoint_t *bp =
+            breakpoint_manager_add(&manager, address, argv[i]);
         if (bp == NULL) {
+            elf_symbol_table_destroy(&elf_symbols);
             return EXIT_FAILURE;
         }
     }
+
+    elf_symbol_table_destroy(&elf_symbols);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -388,7 +645,7 @@ int main(int argc, char *argv[])
             _exit(EXIT_FAILURE);
         }
 
-        execl("./hello", "./hello", NULL);
+        execl(PROGRAM_PATH, PROGRAM_PATH, NULL);
         perror("execl");
         _exit(EXIT_FAILURE);
     }
@@ -412,7 +669,9 @@ int main(int argc, char *argv[])
     breakpoint_manager_print(&manager);
 
     for (size_t i = 0; i < manager.count; ++i) {
-        printf("Before breakpoint #%d:\n", manager.items[i].id);
+        printf("Before breakpoint #%d (%s):\n",
+               manager.items[i].id,
+               manager.items[i].symbol);
         if (print_memory_word(pid, manager.items[i].address) == -1) {
             return EXIT_FAILURE;
         }
@@ -432,7 +691,7 @@ int main(int argc, char *argv[])
     printf("[minigdb] child continued\n");
 
     /*
-     * Chapter 6 event loop:
+     * Chapter 6/7 event loop:
      * wait for breakpoint hits until the debuggee exits.
      */
     for (;;) {
@@ -472,6 +731,7 @@ int main(int argc, char *argv[])
                 ++bp->hit_count;
 
                 printf("\n[minigdb] breakpoint #%d hit!\n", bp->id);
+                printf("[minigdb] symbol = %s\n", bp->symbol);
                 printf("[minigdb] address = 0x%lx\n",
                        (unsigned long)bp->address);
                 printf("[minigdb] hit count = %lu\n", bp->hit_count);
