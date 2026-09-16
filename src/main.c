@@ -11,81 +11,51 @@
 
 #include <unistd.h>
 
+#define MAX_BREAKPOINTS 32
 
 typedef struct {
+    int id;
     uintptr_t address;
     unsigned char saved_byte;
     int enabled;
+    unsigned long hit_count;
 } breakpoint_t;
 
+typedef struct {
+    breakpoint_t items[MAX_BREAKPOINTS];
+    size_t count;
+    int next_id;
+} breakpoint_manager_t;
 
-/*
- * 取得 CPU registers。
- */
-static int get_registers(
-    pid_t pid,
-    struct user_regs_struct *regs
-)
+static int get_registers(pid_t pid, struct user_regs_struct *regs)
 {
-    if (ptrace(
-            PTRACE_GETREGS,
-            pid,
-            NULL,
-            regs
-        ) == -1) {
-
+    if (ptrace(PTRACE_GETREGS, pid, NULL, regs) == -1) {
         perror("ptrace PTRACE_GETREGS");
         return -1;
     }
-
     return 0;
 }
 
-
-/*
- * 修改 CPU registers。
- */
-static int set_registers(
-    pid_t pid,
-    const struct user_regs_struct *regs
-)
+static int set_registers(pid_t pid, const struct user_regs_struct *regs)
 {
-    if (ptrace(
-            PTRACE_SETREGS,
-            pid,
-            NULL,
-            regs
-        ) == -1) {
-
+    if (ptrace(PTRACE_SETREGS, pid, NULL, regs) == -1) {
         perror("ptrace PTRACE_SETREGS");
         return -1;
     }
-
     return 0;
 }
 
-
-/*
- * 顯示 CPU registers。
- */
-static void print_registers(
-    const struct user_regs_struct *regs
-)
+static void print_registers(const struct user_regs_struct *regs)
 {
-    printf("\n");
-    printf("===== CPU Registers =====\n");
-
+    printf("\n===== CPU Registers =====\n");
     printf("RAX = 0x%016llx\n", regs->rax);
     printf("RBX = 0x%016llx\n", regs->rbx);
     printf("RCX = 0x%016llx\n", regs->rcx);
     printf("RDX = 0x%016llx\n", regs->rdx);
-
     printf("RSI = 0x%016llx\n", regs->rsi);
     printf("RDI = 0x%016llx\n", regs->rdi);
-
     printf("RBP = 0x%016llx\n", regs->rbp);
     printf("RSP = 0x%016llx\n", regs->rsp);
-
     printf("R8  = 0x%016llx\n", regs->r8);
     printf("R9  = 0x%016llx\n", regs->r9);
     printf("R10 = 0x%016llx\n", regs->r10);
@@ -94,677 +64,459 @@ static void print_registers(
     printf("R13 = 0x%016llx\n", regs->r13);
     printf("R14 = 0x%016llx\n", regs->r14);
     printf("R15 = 0x%016llx\n", regs->r15);
-
-    printf("\n");
-
-    printf("RIP = 0x%016llx\n", regs->rip);
+    printf("\nRIP = 0x%016llx\n", regs->rip);
     printf("RFLAGS = 0x%016llx\n", regs->eflags);
-
     printf("=========================\n\n");
 }
 
-
-/*
- * 讀取 debuggee memory。
- */
-static int read_memory_word(
-    pid_t pid,
-    uintptr_t address,
-    unsigned long *word
-)
+static int read_memory_word(pid_t pid, uintptr_t address, unsigned long *word)
 {
     errno = 0;
-
-    long data = ptrace(
-        PTRACE_PEEKDATA,
-        pid,
-        (void *)address,
-        NULL
-    );
-
+    long data = ptrace(PTRACE_PEEKDATA, pid, (void *)address, NULL);
     if (data == -1 && errno != 0) {
-
         perror("ptrace PTRACE_PEEKDATA");
         return -1;
     }
-
     *word = (unsigned long)data;
-
     return 0;
 }
 
-
-/*
- * Chapter 5：
- *
- * 寫入 debuggee memory。
- */
-static int write_memory_word(
-    pid_t pid,
-    uintptr_t address,
-    unsigned long word
-)
+static int write_memory_word(pid_t pid, uintptr_t address, unsigned long word)
 {
-    if (ptrace(
-            PTRACE_POKEDATA,
-            pid,
-            (void *)address,
-            (void *)(uintptr_t)word
-        ) == -1) {
-
+    if (ptrace(PTRACE_POKEDATA,
+               pid,
+               (void *)address,
+               (void *)(uintptr_t)word) == -1) {
         perror("ptrace PTRACE_POKEDATA");
         return -1;
     }
-
     return 0;
 }
 
-
-/*
- * 顯示某 address 的 machine word。
- */
-static int print_memory_word(
-    pid_t pid,
-    uintptr_t address
-)
+static int print_memory_word(pid_t pid, uintptr_t address)
 {
     unsigned long word;
-
-    if (read_memory_word(
-            pid,
-            address,
-            &word
-        ) == -1) {
-
+    if (read_memory_word(pid, address, &word) == -1) {
         return -1;
     }
 
-    printf(
-        "Memory @ 0x%lx: ",
-        (unsigned long)address
-    );
-
-    for (size_t i = 0; i < sizeof(word); i++) {
-
-        unsigned int byte =
-            (unsigned int)(
-                (word >> (i * 8)) & 0xff
-            );
-
+    printf("Memory @ 0x%lx: ", (unsigned long)address);
+    for (size_t i = 0; i < sizeof(word); ++i) {
+        unsigned int byte = (unsigned int)((word >> (i * 8)) & 0xffUL);
         printf("%02x ", byte);
     }
-
     printf("\n");
-
     return 0;
 }
 
+static void breakpoint_manager_init(breakpoint_manager_t *manager)
+{
+    manager->count = 0;
+    manager->next_id = 1;
+}
 
-/*
- * 插入 INT3 breakpoint。
- */
-static int breakpoint_enable(
-    pid_t pid,
-    breakpoint_t *bp
-)
+static breakpoint_t *breakpoint_manager_find_by_address(
+    breakpoint_manager_t *manager,
+    uintptr_t address)
+{
+    for (size_t i = 0; i < manager->count; ++i) {
+        if (manager->items[i].address == address) {
+            return &manager->items[i];
+        }
+    }
+    return NULL;
+}
+
+static breakpoint_t *breakpoint_manager_add(
+    breakpoint_manager_t *manager,
+    uintptr_t address)
+{
+    breakpoint_t *existing = breakpoint_manager_find_by_address(manager, address);
+    if (existing != NULL) {
+        return existing;
+    }
+
+    if (manager->count >= MAX_BREAKPOINTS) {
+        fprintf(stderr,
+                "[minigdb] too many breakpoints (max = %d)\n",
+                MAX_BREAKPOINTS);
+        return NULL;
+    }
+
+    breakpoint_t *bp = &manager->items[manager->count++];
+    bp->id = manager->next_id++;
+    bp->address = address;
+    bp->saved_byte = 0;
+    bp->enabled = 0;
+    bp->hit_count = 0;
+    return bp;
+}
+
+static void breakpoint_manager_print(const breakpoint_manager_t *manager)
+{
+    printf("\n===== Breakpoints =====\n");
+    printf("ID   Address             Enabled   Hits\n");
+
+    for (size_t i = 0; i < manager->count; ++i) {
+        const breakpoint_t *bp = &manager->items[i];
+        printf("%-4d 0x%016lx %-9s %lu\n",
+               bp->id,
+               (unsigned long)bp->address,
+               bp->enabled ? "yes" : "no",
+               bp->hit_count);
+    }
+
+    printf("=======================\n\n");
+}
+
+static int breakpoint_enable(pid_t pid, breakpoint_t *bp)
 {
     if (bp->enabled) {
         return 0;
     }
 
     unsigned long word;
-
-    if (read_memory_word(
-            pid,
-            bp->address,
-            &word
-        ) == -1) {
-
+    if (read_memory_word(pid, bp->address, &word) == -1) {
         return -1;
     }
 
-    /*
-     * 保存原始第一個 byte。
-     */
-    bp->saved_byte =
-        (unsigned char)(word & 0xff);
+    bp->saved_byte = (unsigned char)(word & 0xffUL);
+    unsigned long patched = (word & ~0xffUL) | 0xccUL;
 
-    /*
-     * lowest byte:
-     *
-     * original -> CC
-     */
-    unsigned long patched =
-        (word & ~0xffUL) | 0xccUL;
-
-    if (write_memory_word(
-            pid,
-            bp->address,
-            patched
-        ) == -1) {
-
+    if (write_memory_word(pid, bp->address, patched) == -1) {
         return -1;
     }
 
     bp->enabled = 1;
 
-    printf(
-        "[minigdb] breakpoint enabled at 0x%lx\n",
-        (unsigned long)bp->address
-    );
-
-    printf(
-        "[minigdb] saved original byte: 0x%02x\n",
-        bp->saved_byte
-    );
+    printf("[minigdb] breakpoint #%d enabled at 0x%lx "
+           "(saved byte = 0x%02x)\n",
+           bp->id,
+           (unsigned long)bp->address,
+           bp->saved_byte);
 
     return 0;
 }
 
-
-/*
- * 恢復 breakpoint 原本 instruction byte。
- */
-static int breakpoint_disable(
-    pid_t pid,
-    breakpoint_t *bp
-)
+static int breakpoint_disable(pid_t pid, breakpoint_t *bp)
 {
     if (!bp->enabled) {
         return 0;
     }
 
     unsigned long word;
-
-    if (read_memory_word(
-            pid,
-            bp->address,
-            &word
-        ) == -1) {
-
+    if (read_memory_word(pid, bp->address, &word) == -1) {
         return -1;
     }
 
     unsigned long restored =
-        (word & ~0xffUL)
-        | (unsigned long)bp->saved_byte;
+        (word & ~0xffUL) | (unsigned long)bp->saved_byte;
 
-    if (write_memory_word(
-            pid,
-            bp->address,
-            restored
-        ) == -1) {
-
+    if (write_memory_word(pid, bp->address, restored) == -1) {
         return -1;
     }
 
     bp->enabled = 0;
-
     return 0;
 }
 
+static int breakpoint_manager_enable_all(pid_t pid, breakpoint_manager_t *manager)
+{
+    for (size_t i = 0; i < manager->count; ++i) {
+        if (breakpoint_enable(pid, &manager->items[i]) == -1) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /*
- * Breakpoint hit 後：
+ * Chapter 6: reusable machine-instruction single-step primitive.
  *
- * 1. RIP -= 1
- * 2. restore original byte
- * 3. single-step original instruction
- * 4. reinstall breakpoint
+ * Exactly one CPU instruction is executed.  The traced process should then
+ * stop with SIGTRAP, and we show the RIP transition so the step is visible.
  */
-static int recover_breakpoint(
-    pid_t pid,
-    breakpoint_t *bp
-)
+static int single_step_once(pid_t pid, struct user_regs_struct *after_regs)
 {
-    struct user_regs_struct regs;
-
-    if (get_registers(
-            pid,
-            &regs
-        ) == -1) {
-
+    struct user_regs_struct before;
+    if (get_registers(pid, &before) == -1) {
         return -1;
     }
 
-    printf(
-        "[minigdb] RIP after INT3 = 0x%llx\n",
-        regs.rip
-    );
+    printf("[minigdb] single-step: RIP before = 0x%llx\n", before.rip);
 
-    /*
-     * INT3 是 1 byte，
-     * CPU 已經把 RIP 往前移了一格。
-     */
-    regs.rip -= 1;
-
-    printf(
-        "[minigdb] rewinding RIP to 0x%llx\n",
-        regs.rip
-    );
-
-    if (set_registers(
-            pid,
-            &regs
-        ) == -1) {
-
-        return -1;
-    }
-
-    /*
-     * CC → original instruction byte
-     */
-    if (breakpoint_disable(
-            pid,
-            bp
-        ) == -1) {
-
-        return -1;
-    }
-
-    printf(
-        "[minigdb] original instruction restored\n"
-    );
-
-    /*
-     * 只執行原本的那一條 instruction。
-     */
-    if (ptrace(
-            PTRACE_SINGLESTEP,
-            pid,
-            NULL,
-            NULL
-        ) == -1) {
-
+    if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
         perror("ptrace PTRACE_SINGLESTEP");
         return -1;
     }
 
     int status;
-
-    if (waitpid(
-            pid,
-            &status,
-            0
-        ) == -1) {
-
+    if (waitpid(pid, &status, 0) == -1) {
         perror("waitpid");
         return -1;
     }
 
-    /*
-     * 正常情況：
-     *
-     * single-step 完成 → SIGTRAP
-     */
     if (!WIFSTOPPED(status)) {
-
-        fprintf(
-            stderr,
-            "[minigdb] debuggee did not stop after single-step\n"
-        );
-
+        fprintf(stderr,
+                "[minigdb] debuggee did not stop after single-step\n");
         return -1;
     }
 
-    printf(
-        "[minigdb] original instruction executed once\n"
-    );
-
-    /*
-     * 再次：
-     *
-     * original byte → CC
-     */
-    if (breakpoint_enable(
-            pid,
-            bp
-        ) == -1) {
-
+    if (WSTOPSIG(status) != SIGTRAP) {
+        fprintf(stderr,
+                "[minigdb] single-step stopped by signal %d instead of SIGTRAP\n",
+                WSTOPSIG(status));
         return -1;
     }
 
-    printf(
-        "[minigdb] breakpoint reinstalled\n"
-    );
+    if (get_registers(pid, after_regs) == -1) {
+        return -1;
+    }
+
+    printf("[minigdb] single-step: RIP after  = 0x%llx\n",
+           after_regs->rip);
 
     return 0;
 }
 
+/*
+ * Recover a software breakpoint:
+ *   1. RIP points one byte past INT3, so rewind it.
+ *   2. Restore the original first byte.
+ *   3. Single-step the real instruction exactly once.
+ *   4. Reinstall INT3 so the breakpoint remains persistent.
+ */
+static int recover_breakpoint(pid_t pid, breakpoint_t *bp)
+{
+    struct user_regs_struct regs;
+    if (get_registers(pid, &regs) == -1) {
+        return -1;
+    }
 
-int main(
-    int argc,
-    char *argv[]
-)
+    printf("[minigdb] RIP after INT3 = 0x%llx\n", regs.rip);
+
+    regs.rip = bp->address;
+    printf("[minigdb] rewinding RIP to 0x%llx\n", regs.rip);
+
+    if (set_registers(pid, &regs) == -1) {
+        return -1;
+    }
+
+    if (breakpoint_disable(pid, bp) == -1) {
+        return -1;
+    }
+    printf("[minigdb] breakpoint #%d temporarily disabled\n", bp->id);
+    printf("[minigdb] original instruction restored\n");
+
+    struct user_regs_struct after_step;
+    if (single_step_once(pid, &after_step) == -1) {
+        return -1;
+    }
+
+    printf("[minigdb] original instruction executed once\n");
+
+    if (breakpoint_enable(pid, bp) == -1) {
+        return -1;
+    }
+    printf("[minigdb] breakpoint #%d reinstalled\n", bp->id);
+
+    return 0;
+}
+
+static int continue_debuggee(pid_t pid)
+{
+    if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
+        perror("ptrace PTRACE_CONT");
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_address(const char *text, uintptr_t *address)
+{
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 0);
+
+    if (errno != 0 || end == text || *end != '\0') {
+        return -1;
+    }
+
+    *address = (uintptr_t)value;
+    return 0;
+}
+
+int main(int argc, char *argv[])
 {
     /*
-     * Chapter 5 暫時使用 raw address。
+     * Chapter 6 accepts multiple raw breakpoint addresses:
      *
-     * Example:
-     *
-     * ./minigdb 0x401126
+     *   ./minigdb 0x401136 0x401150
      */
-    if (argc != 2) {
-
-        fprintf(
-            stderr,
-            "Usage: %s <breakpoint-address>\n",
-            argv[0]
-        );
-
+    if (argc < 2) {
+        fprintf(stderr,
+                "Usage: %s <breakpoint-address> [breakpoint-address ...]\n",
+                argv[0]);
         return EXIT_FAILURE;
     }
 
+    breakpoint_manager_t manager;
+    breakpoint_manager_init(&manager);
 
-    /*
-     * 把：
-     *
-     * "0x401126"
-     *
-     * 轉成 integer address。
-     */
-    errno = 0;
-
-    char *end = NULL;
-
-    unsigned long long parsed_address =
-        strtoull(
-            argv[1],
-            &end,
-            0
-        );
-
-    if (errno != 0 ||
-        end == argv[1] ||
-        *end != '\0') {
-
-        fprintf(
-            stderr,
-            "Invalid breakpoint address: %s\n",
-            argv[1]
-        );
-
-        return EXIT_FAILURE;
-    }
-
-
-    breakpoint_t breakpoint = {
-        .address = (uintptr_t)parsed_address,
-        .saved_byte = 0,
-        .enabled = 0
-    };
-
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-
-        perror("fork");
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * Child = debuggee
-     */
-    if (pid == 0) {
-
-        if (ptrace(
-                PTRACE_TRACEME,
-                0,
-                NULL,
-                NULL
-            ) == -1) {
-
-            perror("ptrace PTRACE_TRACEME");
-            _exit(EXIT_FAILURE);
+    for (int i = 1; i < argc; ++i) {
+        uintptr_t address;
+        if (parse_address(argv[i], &address) == -1) {
+            fprintf(stderr, "Invalid breakpoint address: %s\n", argv[i]);
+            return EXIT_FAILURE;
         }
 
-        execl(
-            "./hello",
-            "./hello",
-            NULL
-        );
-
-        perror("execl");
-        _exit(EXIT_FAILURE);
-    }
-
-
-    /*
-     * Parent = debugger
-     */
-    printf(
-        "[minigdb] child pid = %d\n",
-        pid
-    );
-
-    int status;
-
-
-    /*
-     * 等 initial exec SIGTRAP。
-     */
-    if (waitpid(
-            pid,
-            &status,
-            0
-        ) == -1) {
-
-        perror("waitpid");
-        return EXIT_FAILURE;
-    }
-
-
-    if (!WIFSTOPPED(status)) {
-
-        fprintf(
-            stderr,
-            "[minigdb] child did not stop after exec\n"
-        );
-
-        return EXIT_FAILURE;
-    }
-
-
-    printf(
-        "[minigdb] initial stop signal = %d\n",
-        WSTOPSIG(status)
-    );
-
-
-    /*
-     * 設定 breakpoint 前先看看原始 bytes。
-     */
-    printf("\nBefore breakpoint:\n");
-
-    if (print_memory_word(
-            pid,
-            breakpoint.address
-        ) == -1) {
-
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * original byte → CC
-     */
-    if (breakpoint_enable(
-            pid,
-            &breakpoint
-        ) == -1) {
-
-        return EXIT_FAILURE;
-    }
-
-
-    printf("\nAfter breakpoint:\n");
-
-    if (print_memory_word(
-            pid,
-            breakpoint.address
-        ) == -1) {
-
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * 讓 debuggee 跑到 breakpoint。
-     */
-    if (ptrace(
-            PTRACE_CONT,
-            pid,
-            NULL,
-            NULL
-        ) == -1) {
-
-        perror("ptrace PTRACE_CONT");
-        return EXIT_FAILURE;
-    }
-
-
-    printf(
-        "\n[minigdb] child continued\n"
-    );
-
-
-    /*
-     * 等待 breakpoint SIGTRAP。
-     */
-    if (waitpid(
-            pid,
-            &status,
-            0
-        ) == -1) {
-
-        perror("waitpid");
-        return EXIT_FAILURE;
-    }
-
-
-    if (!WIFSTOPPED(status)) {
-
-        fprintf(
-            stderr,
-            "[minigdb] child did not stop at breakpoint\n"
-        );
-
-        return EXIT_FAILURE;
-    }
-
-
-    struct user_regs_struct regs;
-
-    if (get_registers(
-            pid,
-            &regs
-        ) == -1) {
-
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * 判斷是不是我們的 breakpoint。
-     *
-     * INT3 後：
-     *
-     * RIP = breakpoint + 1
-     */
-    if (WSTOPSIG(status) == SIGTRAP &&
-        regs.rip - 1 == breakpoint.address) {
-
-        printf(
-            "\n[minigdb] breakpoint hit!\n"
-        );
-
-        printf(
-            "[minigdb] breakpoint address = 0x%lx\n",
-            (unsigned long)breakpoint.address
-        );
-
-        print_registers(&regs);
-
-
-        /*
-         * Breakpoint recovery。
-         */
-        if (recover_breakpoint(
-                pid,
-                &breakpoint
-            ) == -1) {
-
+        breakpoint_t *bp = breakpoint_manager_add(&manager, address);
+        if (bp == NULL) {
             return EXIT_FAILURE;
         }
     }
 
-    else {
-
-        fprintf(
-            stderr,
-            "[minigdb] unexpected stop\n"
-        );
-
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
         return EXIT_FAILURE;
     }
 
+    if (pid == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            perror("ptrace PTRACE_TRACEME");
+            _exit(EXIT_FAILURE);
+        }
 
-    /*
-     * Recovery 完成，
-     * 讓程式繼續執行。
-     */
-    if (ptrace(
-            PTRACE_CONT,
-            pid,
-            NULL,
-            NULL
-        ) == -1) {
-
-        perror("ptrace PTRACE_CONT");
-        return EXIT_FAILURE;
+        execl("./hello", "./hello", NULL);
+        perror("execl");
+        _exit(EXIT_FAILURE);
     }
 
+    printf("[minigdb] child pid = %d\n", pid);
 
-    /*
-     * hello 正常情況會 exit。
-     */
-    if (waitpid(
-            pid,
-            &status,
-            0
-        ) == -1) {
-
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
         perror("waitpid");
         return EXIT_FAILURE;
     }
 
-
-    if (WIFEXITED(status)) {
-
-        printf(
-            "\n[minigdb] child exited with code %d\n",
-            WEXITSTATUS(status)
-        );
+    if (!WIFSTOPPED(status)) {
+        fprintf(stderr, "[minigdb] child did not stop after exec\n");
+        return EXIT_FAILURE;
     }
 
-    else if (WIFSIGNALED(status)) {
+    printf("[minigdb] initial stop signal = %d\n", WSTOPSIG(status));
 
-        printf(
-            "\n[minigdb] child terminated by signal %d\n",
-            WTERMSIG(status)
-        );
+    printf("\n[minigdb] configured breakpoint manager:\n");
+    breakpoint_manager_print(&manager);
+
+    for (size_t i = 0; i < manager.count; ++i) {
+        printf("Before breakpoint #%d:\n", manager.items[i].id);
+        if (print_memory_word(pid, manager.items[i].address) == -1) {
+            return EXIT_FAILURE;
+        }
     }
 
-    else if (WIFSTOPPED(status)) {
-
-        printf(
-            "\n[minigdb] child stopped again by signal %d\n",
-            WSTOPSIG(status)
-        );
+    if (breakpoint_manager_enable_all(pid, &manager) == -1) {
+        return EXIT_FAILURE;
     }
 
+    printf("\n[minigdb] after enabling all breakpoints:\n");
+    breakpoint_manager_print(&manager);
+
+    if (continue_debuggee(pid) == -1) {
+        return EXIT_FAILURE;
+    }
+
+    printf("[minigdb] child continued\n");
+
+    /*
+     * Chapter 6 event loop:
+     * wait for breakpoint hits until the debuggee exits.
+     */
+    for (;;) {
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+            return EXIT_FAILURE;
+        }
+
+        if (WIFEXITED(status)) {
+            printf("\n[minigdb] child exited with code %d\n",
+                   WEXITSTATUS(status));
+            break;
+        }
+
+        if (WIFSIGNALED(status)) {
+            printf("\n[minigdb] child terminated by signal %d\n",
+                   WTERMSIG(status));
+            break;
+        }
+
+        if (!WIFSTOPPED(status)) {
+            continue;
+        }
+
+        int sig = WSTOPSIG(status);
+        struct user_regs_struct regs;
+        if (get_registers(pid, &regs) == -1) {
+            return EXIT_FAILURE;
+        }
+
+        if (sig == SIGTRAP && regs.rip > 0) {
+            uintptr_t candidate = (uintptr_t)(regs.rip - 1);
+            breakpoint_t *bp =
+                breakpoint_manager_find_by_address(&manager, candidate);
+
+            if (bp != NULL && bp->enabled) {
+                ++bp->hit_count;
+
+                printf("\n[minigdb] breakpoint #%d hit!\n", bp->id);
+                printf("[minigdb] address = 0x%lx\n",
+                       (unsigned long)bp->address);
+                printf("[minigdb] hit count = %lu\n", bp->hit_count);
+
+                print_registers(&regs);
+
+                if (recover_breakpoint(pid, bp) == -1) {
+                    return EXIT_FAILURE;
+                }
+
+                if (continue_debuggee(pid) == -1) {
+                    return EXIT_FAILURE;
+                }
+
+                printf("[minigdb] child continued\n");
+                continue;
+            }
+
+            printf("\n[minigdb] SIGTRAP at RIP 0x%llx was not caused by "
+                   "a managed breakpoint\n",
+                   regs.rip);
+
+            if (continue_debuggee(pid) == -1) {
+                return EXIT_FAILURE;
+            }
+            continue;
+        }
+
+        /*
+         * For non-SIGTRAP stops, report the signal and deliver it to the
+         * debuggee when continuing.  This lets a real crash remain a crash.
+         */
+        printf("\n[minigdb] child stopped by signal %d\n", sig);
+
+        if (ptrace(PTRACE_CONT,
+                   pid,
+                   NULL,
+                   (void *)(intptr_t)sig) == -1) {
+            perror("ptrace PTRACE_CONT");
+            return EXIT_FAILURE;
+        }
+    }
+
+    printf("\n[minigdb] final breakpoint statistics:\n");
+    breakpoint_manager_print(&manager);
 
     return EXIT_SUCCESS;
 }
