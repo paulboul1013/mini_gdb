@@ -896,6 +896,731 @@ static uintptr_t elf_value_to_runtime_address(
 }
 
 
+
+/*
+ * Chapter 9.1: minimal DWARF v4 .debug_line decoder.
+ *
+ * Scope of this first step:
+ *   - ELF64 little-endian only (already required by MiniGDB)
+ *   - DWARF v4 line tables only
+ *   - x86-64 style maximum_operations_per_instruction == 1
+ *   - decode rows into: ELF address -> source file:line
+ *
+ * Compile the debuggee with -g -gdwarf-4 for this chapter.
+ */
+#define DW_LNS_COPY 1
+#define DW_LNS_ADVANCE_PC 2
+#define DW_LNS_ADVANCE_LINE 3
+#define DW_LNS_SET_FILE 4
+#define DW_LNS_SET_COLUMN 5
+#define DW_LNS_NEGATE_STMT 6
+#define DW_LNS_SET_BASIC_BLOCK 7
+#define DW_LNS_CONST_ADD_PC 8
+#define DW_LNS_FIXED_ADVANCE_PC 9
+#define DW_LNS_SET_PROLOGUE_END 10
+#define DW_LNS_SET_EPILOGUE_BEGIN 11
+#define DW_LNS_SET_ISA 12
+
+#define DW_LNE_END_SEQUENCE 1
+#define DW_LNE_SET_ADDRESS 2
+#define DW_LNE_DEFINE_FILE 3
+#define DW_LNE_SET_DISCRIMINATOR 4
+
+#define MAX_DWARF_DIRS 64
+#define MAX_DWARF_FILES 256
+#define MAX_SOURCE_PATH 512
+
+typedef struct {
+    uintptr_t address;
+    uint32_t line;
+    uint32_t column;
+    int is_stmt;
+    int end_sequence;
+    char file[MAX_SOURCE_PATH];
+} dwarf_line_row_t;
+
+typedef struct {
+    dwarf_line_row_t *rows;
+    size_t count;
+    size_t capacity;
+} dwarf_line_table_t;
+
+static void dwarf_line_table_destroy(dwarf_line_table_t *table)
+{
+    free(table->rows);
+    memset(table, 0, sizeof(*table));
+}
+
+static int dwarf_line_table_append(
+    dwarf_line_table_t *table,
+    uintptr_t address,
+    const char *file,
+    uint32_t line,
+    uint32_t column,
+    int is_stmt,
+    int end_sequence)
+{
+    if (table->count == table->capacity) {
+        size_t new_capacity = table->capacity == 0 ? 64 : table->capacity * 2;
+        dwarf_line_row_t *new_rows =
+            realloc(table->rows, new_capacity * sizeof(*new_rows));
+        if (new_rows == NULL) {
+            perror("realloc DWARF line rows");
+            return -1;
+        }
+        table->rows = new_rows;
+        table->capacity = new_capacity;
+    }
+
+    dwarf_line_row_t *row = &table->rows[table->count++];
+    row->address = address;
+    row->line = line;
+    row->column = column;
+    row->is_stmt = is_stmt;
+    row->end_sequence = end_sequence;
+    snprintf(row->file, sizeof(row->file), "%s", file != NULL ? file : "<unknown>");
+    return 0;
+}
+
+static int read_u8(const unsigned char **cursor, const unsigned char *end, uint8_t *value)
+{
+    if (*cursor >= end) {
+        return -1;
+    }
+    *value = *(*cursor)++;
+    return 0;
+}
+
+static int read_u16_le(const unsigned char **cursor, const unsigned char *end, uint16_t *value)
+{
+    if ((size_t)(end - *cursor) < 2) {
+        return -1;
+    }
+    const unsigned char *p = *cursor;
+    *value = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    *cursor += 2;
+    return 0;
+}
+
+static int read_u32_le(const unsigned char **cursor, const unsigned char *end, uint32_t *value)
+{
+    if ((size_t)(end - *cursor) < 4) {
+        return -1;
+    }
+    const unsigned char *p = *cursor;
+    *value = (uint32_t)p[0]
+           | ((uint32_t)p[1] << 8)
+           | ((uint32_t)p[2] << 16)
+           | ((uint32_t)p[3] << 24);
+    *cursor += 4;
+    return 0;
+}
+
+static int read_uint_le_n(
+    const unsigned char **cursor,
+    const unsigned char *end,
+    size_t width,
+    uint64_t *value)
+{
+    if (width == 0 || width > 8 || (size_t)(end - *cursor) < width) {
+        return -1;
+    }
+
+    uint64_t result = 0;
+    for (size_t i = 0; i < width; ++i) {
+        result |= (uint64_t)(*cursor)[i] << (8 * i);
+    }
+    *cursor += width;
+    *value = result;
+    return 0;
+}
+
+static int read_uleb128(
+    const unsigned char **cursor,
+    const unsigned char *end,
+    uint64_t *value)
+{
+    uint64_t result = 0;
+    unsigned int shift = 0;
+
+    while (*cursor < end && shift < 64) {
+        uint8_t byte = *(*cursor)++;
+        result |= (uint64_t)(byte & 0x7fU) << shift;
+        if ((byte & 0x80U) == 0) {
+            *value = result;
+            return 0;
+        }
+        shift += 7;
+    }
+    return -1;
+}
+
+static int read_sleb128(
+    const unsigned char **cursor,
+    const unsigned char *end,
+    int64_t *value)
+{
+    int64_t result = 0;
+    unsigned int shift = 0;
+    uint8_t byte = 0;
+
+    while (*cursor < end && shift < 64) {
+        byte = *(*cursor)++;
+        result |= (int64_t)(byte & 0x7fU) << shift;
+        shift += 7;
+        if ((byte & 0x80U) == 0) {
+            if (shift < 64 && (byte & 0x40U) != 0) {
+                result |= -((int64_t)1 << shift);
+            }
+            *value = result;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int read_cstring(
+    const unsigned char **cursor,
+    const unsigned char *end,
+    char *buffer,
+    size_t buffer_size)
+{
+    const unsigned char *start = *cursor;
+    const unsigned char *p = start;
+    while (p < end && *p != '\0') {
+        ++p;
+    }
+    if (p >= end) {
+        return -1;
+    }
+
+    size_t length = (size_t)(p - start);
+    if (buffer_size > 0) {
+        size_t copy_length = length < buffer_size - 1 ? length : buffer_size - 1;
+        memcpy(buffer, start, copy_length);
+        buffer[copy_length] = '\0';
+    }
+
+    *cursor = p + 1;
+    return 0;
+}
+
+static void join_source_path(
+    char *output,
+    size_t output_size,
+    const char *directory,
+    const char *filename)
+{
+    if (directory != NULL && directory[0] != '\0') {
+        snprintf(output, output_size, "%s/%s", directory, filename);
+    } else {
+        snprintf(output, output_size, "%s", filename);
+    }
+}
+
+static const char *dwarf_current_file(
+    char files[MAX_DWARF_FILES][MAX_SOURCE_PATH],
+    size_t file_count,
+    uint64_t file_index)
+{
+    if (file_index == 0 || file_index > file_count) {
+        return "<unknown>";
+    }
+    return files[file_index - 1];
+}
+
+static int dwarf_decode_line_unit(
+    const unsigned char **cursor,
+    const unsigned char *section_end,
+    dwarf_line_table_t *table)
+{
+    uint32_t unit_length = 0;
+    if (read_u32_le(cursor, section_end, &unit_length) == -1) {
+        return -1;
+    }
+
+    if (unit_length == 0xffffffffU) {
+        fprintf(stderr, "[minigdb] DWARF64 .debug_line is not supported in Chapter 9.1\n");
+        return -1;
+    }
+
+    if ((size_t)(section_end - *cursor) < unit_length) {
+        fprintf(stderr, "[minigdb] truncated DWARF .debug_line unit\n");
+        return -1;
+    }
+
+    const unsigned char *unit_end = *cursor + unit_length;
+
+    uint16_t version = 0;
+    if (read_u16_le(cursor, unit_end, &version) == -1) {
+        return -1;
+    }
+
+    if (version != 4) {
+        fprintf(stderr,
+                "[minigdb] Chapter 9.1 supports DWARF v4 .debug_line only (found v%u).\n"
+                "[minigdb] rebuild the debuggee with -g -gdwarf-4.\n",
+                (unsigned int)version);
+        return -1;
+    }
+
+    uint32_t header_length = 0;
+    if (read_u32_le(cursor, unit_end, &header_length) == -1) {
+        return -1;
+    }
+    if ((size_t)(unit_end - *cursor) < header_length) {
+        return -1;
+    }
+    const unsigned char *program_start = *cursor + header_length;
+
+    uint8_t minimum_instruction_length = 0;
+    uint8_t maximum_operations_per_instruction = 0;
+    uint8_t default_is_stmt = 0;
+    uint8_t line_base_raw = 0;
+    uint8_t line_range = 0;
+    uint8_t opcode_base = 0;
+
+    if (read_u8(cursor, program_start, &minimum_instruction_length) == -1 ||
+        read_u8(cursor, program_start, &maximum_operations_per_instruction) == -1 ||
+        read_u8(cursor, program_start, &default_is_stmt) == -1 ||
+        read_u8(cursor, program_start, &line_base_raw) == -1 ||
+        read_u8(cursor, program_start, &line_range) == -1 ||
+        read_u8(cursor, program_start, &opcode_base) == -1) {
+        return -1;
+    }
+
+    int8_t line_base = (int8_t)line_base_raw;
+
+    if (maximum_operations_per_instruction != 1) {
+        fprintf(stderr,
+                "[minigdb] Chapter 9.1 expects max_ops_per_instruction=1, got %u\n",
+                (unsigned int)maximum_operations_per_instruction);
+        return -1;
+    }
+    if (line_range == 0 || opcode_base == 0) {
+        return -1;
+    }
+
+    uint8_t standard_opcode_lengths[256] = {0};
+    for (uint16_t opcode = 1; opcode < opcode_base; ++opcode) {
+        if (read_u8(cursor, program_start, &standard_opcode_lengths[opcode]) == -1) {
+            return -1;
+        }
+    }
+
+    char directories[MAX_DWARF_DIRS][MAX_SOURCE_PATH];
+    size_t directory_count = 0;
+    while (*cursor < program_start) {
+        char directory[MAX_SOURCE_PATH];
+        if (read_cstring(cursor, program_start, directory, sizeof(directory)) == -1) {
+            return -1;
+        }
+        if (directory[0] == '\0') {
+            break;
+        }
+        if (directory_count >= MAX_DWARF_DIRS) {
+            fprintf(stderr, "[minigdb] too many DWARF include directories\n");
+            return -1;
+        }
+        snprintf(directories[directory_count++], MAX_SOURCE_PATH, "%s", directory);
+    }
+
+    char files[MAX_DWARF_FILES][MAX_SOURCE_PATH];
+    size_t file_count = 0;
+    while (*cursor < program_start) {
+        char filename[MAX_SOURCE_PATH];
+        if (read_cstring(cursor, program_start, filename, sizeof(filename)) == -1) {
+            return -1;
+        }
+        if (filename[0] == '\0') {
+            break;
+        }
+
+        uint64_t directory_index = 0;
+        uint64_t modification_time = 0;
+        uint64_t file_size = 0;
+        if (read_uleb128(cursor, program_start, &directory_index) == -1 ||
+            read_uleb128(cursor, program_start, &modification_time) == -1 ||
+            read_uleb128(cursor, program_start, &file_size) == -1) {
+            return -1;
+        }
+        (void)modification_time;
+        (void)file_size;
+
+        if (file_count >= MAX_DWARF_FILES) {
+            fprintf(stderr, "[minigdb] too many DWARF source files\n");
+            return -1;
+        }
+
+        const char *directory = NULL;
+        if (directory_index > 0 && directory_index <= directory_count) {
+            directory = directories[directory_index - 1];
+        }
+        join_source_path(files[file_count], MAX_SOURCE_PATH, directory, filename);
+        ++file_count;
+    }
+
+    *cursor = program_start;
+
+    uintptr_t address = 0;
+    uint64_t file_index = 1;
+    int64_t line = 1;
+    uint64_t column = 0;
+    int is_stmt = default_is_stmt != 0;
+
+    while (*cursor < unit_end) {
+        uint8_t opcode = 0;
+        if (read_u8(cursor, unit_end, &opcode) == -1) {
+            return -1;
+        }
+
+        if (opcode == 0) {
+            uint64_t extended_length = 0;
+            if (read_uleb128(cursor, unit_end, &extended_length) == -1 ||
+                extended_length == 0 ||
+                (uint64_t)(unit_end - *cursor) < extended_length) {
+                return -1;
+            }
+
+            const unsigned char *extended_end = *cursor + extended_length;
+            uint8_t extended_opcode = 0;
+            if (read_u8(cursor, extended_end, &extended_opcode) == -1) {
+                return -1;
+            }
+
+            switch (extended_opcode) {
+            case DW_LNE_END_SEQUENCE:
+                if (dwarf_line_table_append(
+                        table,
+                        address,
+                        dwarf_current_file(files, file_count, file_index),
+                        line < 0 ? 0U : (uint32_t)line,
+                        (uint32_t)column,
+                        is_stmt,
+                        1) == -1) {
+                    return -1;
+                }
+                address = 0;
+                file_index = 1;
+                line = 1;
+                column = 0;
+                is_stmt = default_is_stmt != 0;
+                break;
+
+            case DW_LNE_SET_ADDRESS: {
+                size_t address_width = (size_t)(extended_end - *cursor);
+                uint64_t value = 0;
+                if (read_uint_le_n(cursor, extended_end, address_width, &value) == -1) {
+                    return -1;
+                }
+                address = (uintptr_t)value;
+                break;
+            }
+
+            case DW_LNE_DEFINE_FILE: {
+                if (file_count >= MAX_DWARF_FILES) {
+                    return -1;
+                }
+                char filename[MAX_SOURCE_PATH];
+                uint64_t directory_index = 0;
+                uint64_t ignored = 0;
+                if (read_cstring(cursor, extended_end, filename, sizeof(filename)) == -1 ||
+                    read_uleb128(cursor, extended_end, &directory_index) == -1 ||
+                    read_uleb128(cursor, extended_end, &ignored) == -1 ||
+                    read_uleb128(cursor, extended_end, &ignored) == -1) {
+                    return -1;
+                }
+                const char *directory = NULL;
+                if (directory_index > 0 && directory_index <= directory_count) {
+                    directory = directories[directory_index - 1];
+                }
+                join_source_path(files[file_count], MAX_SOURCE_PATH, directory, filename);
+                ++file_count;
+                break;
+            }
+
+            case DW_LNE_SET_DISCRIMINATOR: {
+                uint64_t ignored = 0;
+                if (read_uleb128(cursor, extended_end, &ignored) == -1) {
+                    return -1;
+                }
+                break;
+            }
+
+            default:
+                break;
+            }
+
+            *cursor = extended_end;
+            continue;
+        }
+
+        if (opcode < opcode_base) {
+            switch (opcode) {
+            case DW_LNS_COPY:
+                if (dwarf_line_table_append(
+                        table,
+                        address,
+                        dwarf_current_file(files, file_count, file_index),
+                        line < 0 ? 0U : (uint32_t)line,
+                        (uint32_t)column,
+                        is_stmt,
+                        0) == -1) {
+                    return -1;
+                }
+                break;
+
+            case DW_LNS_ADVANCE_PC: {
+                uint64_t operation_advance = 0;
+                if (read_uleb128(cursor, unit_end, &operation_advance) == -1) {
+                    return -1;
+                }
+                address += (uintptr_t)(operation_advance * minimum_instruction_length);
+                break;
+            }
+
+            case DW_LNS_ADVANCE_LINE: {
+                int64_t line_increment = 0;
+                if (read_sleb128(cursor, unit_end, &line_increment) == -1) {
+                    return -1;
+                }
+                line += line_increment;
+                break;
+            }
+
+            case DW_LNS_SET_FILE: {
+                uint64_t value = 0;
+                if (read_uleb128(cursor, unit_end, &value) == -1) {
+                    return -1;
+                }
+                file_index = value;
+                break;
+            }
+
+            case DW_LNS_SET_COLUMN: {
+                uint64_t value = 0;
+                if (read_uleb128(cursor, unit_end, &value) == -1) {
+                    return -1;
+                }
+                column = value;
+                break;
+            }
+
+            case DW_LNS_NEGATE_STMT:
+                is_stmt = !is_stmt;
+                break;
+
+            case DW_LNS_SET_BASIC_BLOCK:
+            case DW_LNS_SET_PROLOGUE_END:
+            case DW_LNS_SET_EPILOGUE_BEGIN:
+                break;
+
+            case DW_LNS_CONST_ADD_PC: {
+                uint8_t adjusted_opcode = (uint8_t)(255U - opcode_base);
+                address += (uintptr_t)((adjusted_opcode / line_range) *
+                                       minimum_instruction_length);
+                break;
+            }
+
+            case DW_LNS_FIXED_ADVANCE_PC: {
+                uint16_t advance = 0;
+                if (read_u16_le(cursor, unit_end, &advance) == -1) {
+                    return -1;
+                }
+                address += advance;
+                break;
+            }
+
+            case DW_LNS_SET_ISA: {
+                uint64_t ignored = 0;
+                if (read_uleb128(cursor, unit_end, &ignored) == -1) {
+                    return -1;
+                }
+                break;
+            }
+
+            default:
+                for (uint8_t i = 0; i < standard_opcode_lengths[opcode]; ++i) {
+                    uint64_t ignored = 0;
+                    if (read_uleb128(cursor, unit_end, &ignored) == -1) {
+                        return -1;
+                    }
+                }
+                break;
+            }
+            continue;
+        }
+
+        uint8_t adjusted_opcode = (uint8_t)(opcode - opcode_base);
+        uintptr_t address_increment =
+            (uintptr_t)((adjusted_opcode / line_range) * minimum_instruction_length);
+        int64_t line_increment =
+            (int64_t)line_base + (int64_t)(adjusted_opcode % line_range);
+
+        address += address_increment;
+        line += line_increment;
+
+        if (dwarf_line_table_append(
+                table,
+                address,
+                dwarf_current_file(files, file_count, file_index),
+                line < 0 ? 0U : (uint32_t)line,
+                (uint32_t)column,
+                is_stmt,
+                0) == -1) {
+            return -1;
+        }
+    }
+
+    *cursor = unit_end;
+    return 0;
+}
+
+static int dwarf_line_table_load(const char *path, dwarf_line_table_t *table)
+{
+    memset(table, 0, sizeof(*table));
+
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        perror("fopen DWARF ELF");
+        return -1;
+    }
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, 1, sizeof(ehdr), fp) != sizeof(ehdr)) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_shoff == 0 ||
+        ehdr.e_shnum == 0 ||
+        ehdr.e_shentsize != sizeof(Elf64_Shdr) ||
+        ehdr.e_shstrndx == SHN_UNDEF ||
+        ehdr.e_shstrndx >= ehdr.e_shnum) {
+        fclose(fp);
+        return -1;
+    }
+
+    Elf64_Shdr *sections = calloc((size_t)ehdr.e_shnum, sizeof(*sections));
+    if (sections == NULL) {
+        perror("calloc DWARF sections");
+        fclose(fp);
+        return -1;
+    }
+
+    if (read_file_region(fp,
+                         (long)ehdr.e_shoff,
+                         sections,
+                         (size_t)ehdr.e_shnum * sizeof(*sections)) == -1) {
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    const Elf64_Shdr *shstr_section = &sections[ehdr.e_shstrndx];
+    size_t shstr_size = (size_t)shstr_section->sh_size;
+    char *shstr = malloc(shstr_size + 1);
+    if (shstr == NULL) {
+        perror("malloc section-name table");
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    if (read_file_region(fp,
+                         (long)shstr_section->sh_offset,
+                         shstr,
+                         shstr_size) == -1) {
+        free(shstr);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+    shstr[shstr_size] = '\0';
+
+    const Elf64_Shdr *debug_line_section = NULL;
+    for (size_t i = 0; i < (size_t)ehdr.e_shnum; ++i) {
+        if ((size_t)sections[i].sh_name >= shstr_size) {
+            continue;
+        }
+        const char *name = shstr + sections[i].sh_name;
+        if (strcmp(name, ".debug_line") == 0) {
+            debug_line_section = &sections[i];
+            break;
+        }
+    }
+
+    if (debug_line_section == NULL) {
+        fprintf(stderr,
+                "[minigdb] no .debug_line section found; compile the debuggee with -g -gdwarf-4\n");
+        free(shstr);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    size_t section_size = (size_t)debug_line_section->sh_size;
+    unsigned char *data = malloc(section_size);
+    if (data == NULL && section_size != 0) {
+        perror("malloc .debug_line");
+        free(shstr);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    if (read_file_region(fp,
+                         (long)debug_line_section->sh_offset,
+                         data,
+                         section_size) == -1) {
+        free(data);
+        free(shstr);
+        free(sections);
+        fclose(fp);
+        return -1;
+    }
+
+    free(shstr);
+    free(sections);
+    fclose(fp);
+
+    const unsigned char *cursor = data;
+    const unsigned char *end = data + section_size;
+    while (cursor < end) {
+        if (dwarf_decode_line_unit(&cursor, end, table) == -1) {
+            free(data);
+            dwarf_line_table_destroy(table);
+            return -1;
+        }
+    }
+
+    free(data);
+
+    printf("[minigdb] loaded DWARF v4 .debug_line (%zu rows)\n", table->count);
+    return 0;
+}
+
+static void dwarf_line_table_print(const dwarf_line_table_t *table)
+{
+    printf("\n===== DWARF Line Table (ELF addresses) =====\n");
+    printf("Address            File                              Line   Column  Flags\n");
+
+    for (size_t i = 0; i < table->count; ++i) {
+        const dwarf_line_row_t *row = &table->rows[i];
+        printf("0x%016lx %-33s %-6u %-7u %s%s\n",
+               (unsigned long)row->address,
+               row->file,
+               row->line,
+               row->column,
+               row->is_stmt ? "is_stmt" : "",
+               row->end_sequence ? " end_sequence" : "");
+    }
+
+    printf("=============================================\n\n");
+}
+
 static int parse_runtime_address(const char *text, uintptr_t *address)
 {
     const char *number = text;
@@ -927,6 +1652,7 @@ static void print_help(void)
     printf("  x <address|rip>                 Read one machine word from memory\n");
     printf("  info breakpoints, info b        List managed breakpoints\n");
     printf("  info target                     Show target ELF/runtime information\n");
+    printf("  info lines                      Show decoded DWARF v4 line table\n");
     printf("  quit, q                         Kill the debuggee and exit MiniGDB\n");
     printf("\nChapter mapping:\n");
     printf("  regs              Chapter 3 - register inspection\n");
@@ -934,7 +1660,8 @@ static void print_help(void)
     printf("  break             Chapter 5 - INT3 software breakpoint\n");
     printf("  step/info b       Chapter 6 - single-step + breakpoint manager\n");
     printf("  break <symbol>    Chapter 7 - ELF symbol resolution\n");
-    printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n\n");
+    printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n");
+    printf("  info lines        Chapter 9.1 - DWARF .debug_line decoding\n\n");
 }
 
 static int add_breakpoint_from_text(
@@ -1129,9 +1856,17 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    dwarf_line_table_t line_table;
+    if (dwarf_line_table_load(program_path, &line_table) == -1) {
+        fprintf(stderr,
+                "[minigdb] warning: source-line support disabled for this run\n");
+        memset(&line_table, 0, sizeof(line_table));
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        dwarf_line_table_destroy(&line_table);
         elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
@@ -1153,12 +1888,14 @@ int main(int argc, char *argv[])
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         perror("waitpid");
+        dwarf_line_table_destroy(&line_table);
         elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
 
     if (!WIFSTOPPED(status)) {
         fprintf(stderr, "[minigdb] child did not stop after exec\n");
+        dwarf_line_table_destroy(&line_table);
         elf_image_destroy(&image);
         return EXIT_FAILURE;
     }
@@ -1167,6 +1904,7 @@ int main(int argc, char *argv[])
 
     uintptr_t load_bias;
     if (find_runtime_load_bias(pid, &image, &load_bias) == -1) {
+        dwarf_line_table_destroy(&line_table);
         elf_image_destroy(&image);
         kill_debuggee(pid);
         return EXIT_FAILURE;
@@ -1277,7 +2015,7 @@ int main(int argc, char *argv[])
         if (strcmp(command, "info") == 0) {
             char *argument = strtok_r(NULL, " \t", &saveptr);
             if (argument == NULL) {
-                printf("usage: info breakpoints | info target\n");
+                printf("usage: info breakpoints | info target | info lines\n");
                 continue;
             }
 
@@ -1295,7 +2033,17 @@ int main(int argc, char *argv[])
                 printf("Load bias : 0x%lx\n", (unsigned long)load_bias);
                 printf("Symbols   : %zu\n", image.symbol_count);
                 printf("PHDRs     : %zu\n", image.program_header_count);
+                printf("DWARF rows: %zu\n", line_table.count);
                 printf("==================\n\n");
+                continue;
+            }
+
+            if (strcmp(argument, "lines") == 0) {
+                if (line_table.count == 0) {
+                    printf("[minigdb] no decoded DWARF line table is available\n");
+                } else {
+                    dwarf_line_table_print(&line_table);
+                }
                 continue;
             }
 
@@ -1318,6 +2066,7 @@ int main(int argc, char *argv[])
     printf("\n[minigdb] final breakpoint statistics:\n");
     breakpoint_manager_print(&manager);
 
+    dwarf_line_table_destroy(&line_table);
     elf_image_destroy(&image);
     return EXIT_SUCCESS;
 }
