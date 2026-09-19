@@ -283,6 +283,77 @@ static int single_step_once(pid_t pid, struct user_regs_struct *after_regs)
 }
 
 /*
+ * Breakpoint-aware user step.
+ *
+ * If RIP is already sitting on an enabled software breakpoint, memory at RIP
+ * contains INT3 (0xCC), not the program's original first byte.  A raw
+ * PTRACE_SINGLESTEP would therefore execute INT3 instead of the real
+ * instruction.  Temporarily remove that breakpoint, step exactly one original
+ * instruction, then reinstall the breakpoint.
+ *
+ * Reaching another breakpoint address as the result of the stepped instruction
+ * is only an arrival at that address; INT3 has not executed yet, so hit_count is
+ * intentionally not incremented.
+ */
+static int step_debuggee(
+    pid_t pid,
+    breakpoint_manager_t *manager,
+    struct user_regs_struct *after_regs)
+{
+    struct user_regs_struct before;
+    if (get_registers(pid, &before) == -1) {
+        return -1;
+    }
+
+    breakpoint_t *current_bp =
+        breakpoint_manager_find_by_address(manager, (uintptr_t)before.rip);
+    int temporarily_removed =
+        current_bp != NULL && current_bp->enabled;
+
+    if (temporarily_removed) {
+        printf("[minigdb] step: RIP is at breakpoint #%d (%s) at 0x%llx\n",
+               current_bp->id,
+               current_bp->symbol,
+               before.rip);
+        printf("[minigdb] step: restoring original instruction before stepping\n");
+
+        if (breakpoint_disable(pid, current_bp) == -1) {
+            return -1;
+        }
+    }
+
+    if (single_step_once(pid, after_regs) == -1) {
+        /* Best effort: if the process is still stopped, restore debugger state. */
+        if (temporarily_removed) {
+            (void)breakpoint_enable(pid, current_bp);
+        }
+        return -1;
+    }
+
+    if (temporarily_removed) {
+        if (breakpoint_enable(pid, current_bp) == -1) {
+            return -1;
+        }
+        printf("[minigdb] step: breakpoint #%d reinstalled\n",
+               current_bp->id);
+    }
+
+    breakpoint_t *arrived_bp =
+        breakpoint_manager_find_by_address(manager,
+                                           (uintptr_t)after_regs->rip);
+    if (arrived_bp != NULL && arrived_bp->enabled) {
+        printf("[minigdb] step: arrived at breakpoint #%d (%s) address 0x%llx\n",
+               arrived_bp->id,
+               arrived_bp->symbol,
+               after_regs->rip);
+        printf("[minigdb] step: INT3 has not executed; hit count remains %lu\n",
+               arrived_bp->hit_count);
+    }
+
+    return 0;
+}
+
+/*
  * Recover a software breakpoint:
  *   1. RIP points one byte past INT3, so rewind it.
  *   2. Restore the original first byte.
@@ -851,7 +922,7 @@ static void print_help(void)
     printf("  break, b <symbol|address>       Set a software breakpoint\n");
     printf("                                  Examples: b main, b foo, b 0x401000\n");
     printf("  continue, c                     Continue until next stop/breakpoint\n");
-    printf("  step, s                         Execute exactly one CPU instruction\n");
+    printf("  step, s                         Execute one original CPU instruction safely\n");
     printf("  regs, r                         Show x86-64 CPU registers\n");
     printf("  x <address|rip>                 Read one machine word from memory\n");
     printf("  info breakpoints, info b        List managed breakpoints\n");
@@ -1163,7 +1234,7 @@ int main(int argc, char *argv[])
 
         if (strcmp(command, "step") == 0 || strcmp(command, "s") == 0) {
             struct user_regs_struct after;
-            if (single_step_once(pid, &after) == -1) {
+            if (step_debuggee(pid, &manager, &after) == -1) {
                 child_alive = 0;
             }
             continue;
