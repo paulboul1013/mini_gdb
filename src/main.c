@@ -1775,6 +1775,162 @@ static void print_current_source_location(
     printf("===========================\n\n");
 }
 
+
+/*
+ * Chapter 9.3: reverse Chapter 9.2's lookup direction.
+ *
+ *     source file:line -> DWARF line row -> ELF address
+ *
+ * A source line may correspond to more than one line-table row.  For this
+ * minimal implementation we prefer the first matching is_stmt row, because
+ * DWARF marks it as a useful statement boundary for source-level debugging.
+ * If no matching row has is_stmt set, the first ordinary matching row is used
+ * as a fallback.  end_sequence rows are markers, not executable source rows,
+ * so they are never returned.
+ */
+static const char *source_path_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash != NULL ? slash + 1 : path;
+}
+
+static int dwarf_line_lookup_source_pass(
+    const dwarf_line_table_t *table,
+    const char *file,
+    uint32_t line,
+    int basename_only,
+    const dwarf_line_row_t **result)
+{
+    const dwarf_line_row_t *fallback = NULL;
+
+    for (size_t i = 0; i < table->count; ++i) {
+        const dwarf_line_row_t *row = &table->rows[i];
+
+        if (row->end_sequence || row->line != line) {
+            continue;
+        }
+
+        int file_matches;
+        if (basename_only) {
+            file_matches =
+                strcmp(source_path_basename(row->file),
+                       source_path_basename(file)) == 0;
+        } else {
+            file_matches = strcmp(row->file, file) == 0;
+        }
+
+        if (!file_matches) {
+            continue;
+        }
+
+        if (fallback == NULL) {
+            fallback = row;
+        }
+
+        if (row->is_stmt) {
+            *result = row;
+            return 0;
+        }
+    }
+
+    if (fallback != NULL) {
+        *result = fallback;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int dwarf_line_lookup_source(
+    const dwarf_line_table_t *table,
+    const char *file,
+    uint32_t line,
+    const dwarf_line_row_t **result)
+{
+    if (table == NULL || file == NULL || result == NULL ||
+        table->count == 0 || file[0] == '\0' || line == 0) {
+        return -1;
+    }
+
+    *result = NULL;
+
+    /* Prefer an exact DWARF path match before falling back to basename. */
+    if (dwarf_line_lookup_source_pass(
+            table, file, line, 0, result) == 0) {
+        return 0;
+    }
+
+    return dwarf_line_lookup_source_pass(
+        table, file, line, 1, result);
+}
+
+static int parse_source_location(
+    const char *text,
+    char *file,
+    size_t file_size,
+    uint32_t *line)
+{
+    if (text == NULL || file == NULL || file_size == 0 || line == NULL) {
+        return -1;
+    }
+
+    const char *colon = strrchr(text, ':');
+    if (colon == NULL || colon == text || colon[1] == '\0') {
+        return -1;
+    }
+
+    size_t file_length = (size_t)(colon - text);
+    if (file_length >= file_size) {
+        return -1;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(colon + 1, &end, 10);
+    if (errno != 0 || end == colon + 1 || *end != '\0' ||
+        value == 0 || value > UINT32_MAX) {
+        return -1;
+    }
+
+    memcpy(file, text, file_length);
+    file[file_length] = '\0';
+    *line = (uint32_t)value;
+    return 0;
+}
+
+static void print_source_address_lookup(
+    const dwarf_line_table_t *table,
+    const char *text)
+{
+    char file[MAX_SOURCE_PATH];
+    uint32_t line = 0;
+
+    if (parse_source_location(text, file, sizeof(file), &line) == -1) {
+        printf("[minigdb] invalid source location: %s\n", text);
+        printf("[minigdb] expected format: <file>:<line>, e.g. hello.c:11\n");
+        return;
+    }
+
+    const dwarf_line_row_t *row = NULL;
+    if (dwarf_line_lookup_source(table, file, line, &row) == -1) {
+        printf("[minigdb] no executable DWARF row for %s:%u\n",
+               file,
+               line);
+        return;
+    }
+
+    printf("\n===== Source Address =====\n");
+    printf("Requested   : %s:%u\n", file, line);
+    printf("Resolved    : %s:%u", row->file, row->line);
+    if (row->column != 0) {
+        printf(":%u", row->column);
+    }
+    printf("\n");
+    printf("ELF address : 0x%016lx\n", (unsigned long)row->address);
+    printf("is_stmt     : %s\n", row->is_stmt ? "yes" : "no");
+    printf("==========================\n\n");
+}
+
 static int parse_runtime_address(const char *text, uintptr_t *address)
 {
     const char *number = text;
@@ -1808,6 +1964,7 @@ static void print_help(void)
     printf("  info target                     Show target ELF/runtime information\n");
     printf("  info lines                      Show decoded DWARF v4 line table\n");
     printf("  info source                     Map current RIP to source file:line\n");
+    printf("  info address <file:line>        Map source file:line to ELF address\n");
     printf("  quit, q                         Kill the debuggee and exit MiniGDB\n");
     printf("\nChapter mapping:\n");
     printf("  regs              Chapter 3 - register inspection\n");
@@ -1817,7 +1974,8 @@ static void print_help(void)
     printf("  break <symbol>    Chapter 7 - ELF symbol resolution\n");
     printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n");
     printf("  info lines        Chapter 9.1 - DWARF .debug_line decoding\n");
-    printf("  info source       Chapter 9.2 - runtime RIP to source lookup\n\n");
+    printf("  info source       Chapter 9.2 - runtime RIP to source lookup\n");
+    printf("  info address      Chapter 9.3 - source file:line to ELF lookup\n\n");
 }
 
 static int add_breakpoint_from_text(
@@ -2171,7 +2329,7 @@ int main(int argc, char *argv[])
         if (strcmp(command, "info") == 0) {
             char *argument = strtok_r(NULL, " \t", &saveptr);
             if (argument == NULL) {
-                printf("usage: info breakpoints | info target | info lines | info source\n");
+                printf("usage: info breakpoints | info target | info lines | info source | info address <file:line>\n");
                 continue;
             }
 
@@ -2209,6 +2367,18 @@ int main(int argc, char *argv[])
                 } else {
                     print_current_source_location(
                         pid, &image, &line_table, load_bias);
+                }
+                continue;
+            }
+
+            if (strcmp(argument, "address") == 0) {
+                char *location = strtok_r(NULL, " \t", &saveptr);
+                if (location == NULL) {
+                    printf("usage: info address <file:line>\n");
+                } else if (line_table.count == 0) {
+                    printf("[minigdb] no decoded DWARF line table is available\n");
+                } else {
+                    print_source_address_lookup(&line_table, location);
                 }
                 continue;
             }
