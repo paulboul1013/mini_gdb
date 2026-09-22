@@ -895,6 +895,54 @@ static uintptr_t elf_value_to_runtime_address(
     return elf_value;
 }
 
+/*
+ * Chapter 9.2: convert the address domain used by ptrace/RIP back into the
+ * ELF/DWARF address domain.  For a PIE (ET_DYN) image, Chapter 8 established:
+ *
+ *     runtime = load_bias + elf_value
+ *
+ * so source lookup needs the inverse mapping:
+ *
+ *     elf_value = runtime - load_bias
+ *
+ * A traditional ET_EXEC image needs no relocation here.
+ */
+static int runtime_address_to_elf_value(
+    const elf_image_t *image,
+    uintptr_t runtime_address,
+    uintptr_t load_bias,
+    uintptr_t *elf_value)
+{
+    uintptr_t candidate = runtime_address;
+
+    if (image->type == ET_DYN) {
+        if (runtime_address < load_bias) {
+            return -1;
+        }
+        candidate = runtime_address - load_bias;
+    }
+
+    /*
+     * Do not mistake an address in ld-linux/libc for an address in the target
+     * executable merely because subtraction happened to be possible.  The
+     * converted ELF value must fall inside one of this image's PT_LOAD ranges.
+     */
+    for (size_t i = 0; i < image->program_header_count; ++i) {
+        const Elf64_Phdr *phdr = &image->program_headers[i];
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0) {
+            continue;
+        }
+
+        uintptr_t start = (uintptr_t)phdr->p_vaddr;
+        uintptr_t size = (uintptr_t)phdr->p_memsz;
+        if (candidate >= start && candidate - start < size) {
+            *elf_value = candidate;
+            return 0;
+        }
+    }
+
+    return -1;
+}
 
 
 /*
@@ -1621,6 +1669,112 @@ static void dwarf_line_table_print(const dwarf_line_table_t *table)
     printf("=============================================\n\n");
 }
 
+/*
+ * Chapter 9.2: resolve one ELF address to the source row whose address range
+ * contains it.  A normal DWARF line row is the START of a range; it is not
+ * merely an exact-address record.
+ *
+ * Example:
+ *
+ *     0x1194 -> line 10
+ *     0x119c -> line 11
+ *
+ * means every address in [0x1194, 0x119c) maps to line 10.
+ *
+ * end_sequence is a hard upper bound.  We never allow a lookup to leak from
+ * the end of one DWARF sequence into the next sequence.
+ */
+static int dwarf_line_lookup_address(
+    const dwarf_line_table_t *table,
+    uintptr_t elf_address,
+    const dwarf_line_row_t **result)
+{
+    if (table == NULL || result == NULL || table->count == 0) {
+        return -1;
+    }
+
+    *result = NULL;
+
+    for (size_t i = 0; i < table->count; ++i) {
+        const dwarf_line_row_t *row = &table->rows[i];
+
+        if (row->end_sequence) {
+            continue;
+        }
+
+        /* Find the next row that supplies this row's exclusive upper bound. */
+        size_t next_index = i + 1;
+        while (next_index < table->count &&
+               !table->rows[next_index].end_sequence &&
+               table->rows[next_index].address == row->address) {
+            ++next_index;
+        }
+
+        if (next_index >= table->count) {
+            continue;
+        }
+
+        const dwarf_line_row_t *next = &table->rows[next_index];
+        uintptr_t range_end = next->address;
+
+        if (range_end <= row->address) {
+            continue;
+        }
+
+        if (elf_address >= row->address && elf_address < range_end) {
+            /* If several rows share one address, use the last such row. */
+            size_t chosen = next_index - 1;
+            *result = &table->rows[chosen];
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static void print_current_source_location(
+    pid_t pid,
+    const elf_image_t *image,
+    const dwarf_line_table_t *table,
+    uintptr_t load_bias)
+{
+    struct user_regs_struct regs;
+    if (get_registers(pid, &regs) == -1) {
+        return;
+    }
+
+    uintptr_t runtime_rip = (uintptr_t)regs.rip;
+    uintptr_t elf_address = 0;
+
+    printf("\n===== Source Location =====\n");
+    printf("Runtime RIP : 0x%016lx\n", (unsigned long)runtime_rip);
+
+    if (runtime_address_to_elf_value(
+            image, runtime_rip, load_bias, &elf_address) == -1) {
+        printf("ELF address : <outside target image>\n");
+        printf("Source      : <no source location>\n");
+        printf("===========================\n\n");
+        return;
+    }
+
+    printf("ELF address : 0x%016lx\n", (unsigned long)elf_address);
+
+    const dwarf_line_row_t *row = NULL;
+    if (dwarf_line_lookup_address(table, elf_address, &row) == -1) {
+        printf("Source      : <no DWARF source location>\n");
+        printf("===========================\n\n");
+        return;
+    }
+
+    printf("Source      : %s:%u", row->file, row->line);
+    if (row->column != 0) {
+        printf(":%u", row->column);
+    }
+    printf("\n");
+    printf("Range start : 0x%016lx\n", (unsigned long)row->address);
+    printf("===========================\n\n");
+}
+
 static int parse_runtime_address(const char *text, uintptr_t *address)
 {
     const char *number = text;
@@ -1653,6 +1807,7 @@ static void print_help(void)
     printf("  info breakpoints, info b        List managed breakpoints\n");
     printf("  info target                     Show target ELF/runtime information\n");
     printf("  info lines                      Show decoded DWARF v4 line table\n");
+    printf("  info source                     Map current RIP to source file:line\n");
     printf("  quit, q                         Kill the debuggee and exit MiniGDB\n");
     printf("\nChapter mapping:\n");
     printf("  regs              Chapter 3 - register inspection\n");
@@ -1661,7 +1816,8 @@ static void print_help(void)
     printf("  step/info b       Chapter 6 - single-step + breakpoint manager\n");
     printf("  break <symbol>    Chapter 7 - ELF symbol resolution\n");
     printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n");
-    printf("  info lines        Chapter 9.1 - DWARF .debug_line decoding\n\n");
+    printf("  info lines        Chapter 9.1 - DWARF .debug_line decoding\n");
+    printf("  info source       Chapter 9.2 - runtime RIP to source lookup\n\n");
 }
 
 static int add_breakpoint_from_text(
@@ -2015,7 +2171,7 @@ int main(int argc, char *argv[])
         if (strcmp(command, "info") == 0) {
             char *argument = strtok_r(NULL, " \t", &saveptr);
             if (argument == NULL) {
-                printf("usage: info breakpoints | info target | info lines\n");
+                printf("usage: info breakpoints | info target | info lines | info source\n");
                 continue;
             }
 
@@ -2043,6 +2199,16 @@ int main(int argc, char *argv[])
                     printf("[minigdb] no decoded DWARF line table is available\n");
                 } else {
                     dwarf_line_table_print(&line_table);
+                }
+                continue;
+            }
+
+            if (strcmp(argument, "source") == 0) {
+                if (line_table.count == 0) {
+                    printf("[minigdb] no decoded DWARF line table is available\n");
+                } else {
+                    print_current_source_location(
+                        pid, &image, &line_table, load_bias);
                 }
                 continue;
             }
