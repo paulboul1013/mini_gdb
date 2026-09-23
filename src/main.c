@@ -1954,8 +1954,8 @@ static void print_help(void)
 {
     printf("\nMiniGDB commands:\n");
     printf("  help, h                         Show this help message\n");
-    printf("  break, b <symbol|address>       Set a software breakpoint\n");
-    printf("                                  Examples: b main, b foo, b 0x401000\n");
+    printf("  break, b <location>             Set a software breakpoint\n");
+    printf("                                  Examples: b main, b 0x401000, b hello.c:11\n");
     printf("  continue, c                     Continue until next stop/breakpoint\n");
     printf("  step, s                         Execute one original CPU instruction safely\n");
     printf("  regs, r                         Show x86-64 CPU registers\n");
@@ -1975,13 +1975,30 @@ static void print_help(void)
     printf("  info target       Chapter 8 - PIE/ASLR load-bias resolution\n");
     printf("  info lines        Chapter 9.1 - DWARF .debug_line decoding\n");
     printf("  info source       Chapter 9.2 - runtime RIP to source lookup\n");
-    printf("  info address      Chapter 9.3 - source file:line to ELF lookup\n\n");
+    printf("  info address      Chapter 9.3 - source file:line to ELF lookup\n");
+    printf("  break <file:line> Chapter 9.4 - source-level software breakpoint\n\n");
 }
 
+/*
+ * Chapter 9.4: resolve every user-facing breakpoint location into one runtime
+ * address before handing it to the existing breakpoint manager.
+ *
+ * Resolution order:
+ *
+ *     raw runtime address
+ *         OR
+ *     source file:line -> DWARF row -> ELF address -> runtime address
+ *         OR
+ *     symbol -> ELF address -> runtime address
+ *
+ * The actual INT3 mechanism remains unchanged: once resolution is complete,
+ * the breakpoint manager only sees one runtime address.
+ */
 static int add_breakpoint_from_text(
     pid_t pid,
     breakpoint_manager_t *manager,
     const elf_image_t *image,
+    const dwarf_line_table_t *line_table,
     uintptr_t load_bias,
     const char *text)
 {
@@ -1993,21 +2010,69 @@ static int add_breakpoint_from_text(
         printf("[minigdb] raw runtime address = 0x%lx\n",
                (unsigned long)runtime_address);
     } else {
-        uintptr_t elf_value = 0;
-        if (elf_find_function(image, text, &elf_value) == -1) {
-            fprintf(stderr, "[minigdb] function symbol not found: %s\n", text);
-            return -1;
+        char source_file[MAX_SOURCE_PATH];
+        uint32_t source_line = 0;
+
+        if (parse_source_location(
+                text,
+                source_file,
+                sizeof(source_file),
+                &source_line) == 0) {
+            if (line_table == NULL || line_table->count == 0) {
+                fprintf(stderr,
+                        "[minigdb] cannot resolve source breakpoint: "
+                        "no DWARF line table is available\n");
+                return -1;
+            }
+
+            const dwarf_line_row_t *row = NULL;
+            if (dwarf_line_lookup_source(
+                    line_table, source_file, source_line, &row) == -1) {
+                fprintf(stderr,
+                        "[minigdb] no executable DWARF row for %s:%u\n",
+                        source_file,
+                        source_line);
+                return -1;
+            }
+
+            uintptr_t elf_value = row->address;
+            runtime_address =
+                elf_value_to_runtime_address(image, elf_value, load_bias);
+
+            snprintf(display_name, sizeof(display_name), "%s", text);
+
+            printf("[minigdb] source breakpoint resolution:\n");
+            printf("           requested = %s:%u\n",
+                   source_file,
+                   source_line);
+            printf("           resolved  = %s:%u", row->file, row->line);
+            if (row->column != 0) {
+                printf(":%u", row->column);
+            }
+            printf("\n");
+            printf("           ELF       = 0x%lx\n",
+                   (unsigned long)elf_value);
+            printf("           runtime   = 0x%lx\n",
+                   (unsigned long)runtime_address);
+        } else {
+            uintptr_t elf_value = 0;
+            if (elf_find_function(image, text, &elf_value) == -1) {
+                fprintf(stderr,
+                        "[minigdb] breakpoint location not found: %s\n",
+                        text);
+                return -1;
+            }
+
+            runtime_address =
+                elf_value_to_runtime_address(image, elf_value, load_bias);
+
+            snprintf(display_name, sizeof(display_name), "%s", text);
+
+            printf("[minigdb] resolved %-20s ELF=0x%lx runtime=0x%lx\n",
+                   text,
+                   (unsigned long)elf_value,
+                   (unsigned long)runtime_address);
         }
-
-        runtime_address =
-            elf_value_to_runtime_address(image, elf_value, load_bias);
-
-        snprintf(display_name, sizeof(display_name), "%s", text);
-
-        printf("[minigdb] resolved %-20s ELF=0x%lx runtime=0x%lx\n",
-               text,
-               (unsigned long)elf_value,
-               (unsigned long)runtime_address);
     }
 
     breakpoint_t *existing =
@@ -2260,13 +2325,14 @@ int main(int argc, char *argv[])
         if (strcmp(command, "break") == 0 || strcmp(command, "b") == 0) {
             char *argument = strtok_r(NULL, " \t", &saveptr);
             if (argument == NULL) {
-                printf("usage: break <symbol|address>\n");
+                printf("usage: break <symbol|address|file:line>\n");
                 continue;
             }
 
             if (add_breakpoint_from_text(pid,
                                          &manager,
                                          &image,
+                                         &line_table,
                                          load_bias,
                                          argument) == -1) {
                 printf("[minigdb] failed to create breakpoint\n");
